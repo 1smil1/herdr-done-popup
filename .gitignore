@@ -1,3 +1,6 @@
 target/
 *.exe
 Cargo.lock.bak
+build-errors.txt
+start.err
+start.out
