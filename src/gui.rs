@@ -48,8 +48,11 @@ const MARGIN: i32 = 20;
 const GAP: i32 = 8;
 const ROUND: i32 = 20; // 柔和圆角
 const CLOSE_W: i32 = 42; // 右上角关闭热区宽度
-const AUTO_DISMISS_MS: u32 = 5000; // 5 秒自动关闭
+const AUTO_DISMISS_MS: u32 = 10000; // 10 秒自动关闭
+const FOLLOW_POLL_MS: u32 = 500; // 0.5 秒轮询用户是否已“跟进”到对应 workspace
 const RECENT_INPUT_MS: u32 = 5000; // 5 秒内有输入视为“正在操作”
+const ID_TIMER_DISMISS: usize = 1;
+const ID_TIMER_FOLLOW: usize = 2;
 
 static ACTIVE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -261,6 +264,31 @@ fn parse_session_from_title(title_lc: &str) -> Option<String> {
     Some("default".to_string())
 }
 
+/// 轮询：用户是不是已经“跟进”到了这个 popup 对应的 workspace？
+/// 是的话销毁 popup（说明用户已经看到并切过去处理了）。
+unsafe fn user_moved_into_workspace(info: &PopupInfo) -> bool {
+    if !foreground_is_herdr() {
+        return false;
+    }
+    let title = foreground_title();
+    let parsed = parse_session_from_title(&title.to_lowercase());
+    let parsed = match parsed {
+        Some(s) => s,
+        None => return false,
+    };
+    if parsed != info.session.to_lowercase() {
+        return false;
+    }
+    let workspace_id = info.pane.split(':').next().unwrap_or("");
+    if workspace_id.is_empty() {
+        return false;
+    }
+    match focused_workspace_in(&info.session) {
+        Some(focused) => focused == workspace_id,
+        None => false,
+    }
+}
+
 unsafe fn foreground_is_herdr() -> bool {
     let title = foreground_title();
     title.to_lowercase().contains("herdr")
@@ -375,11 +403,14 @@ unsafe fn create_popup(owner: HWND, info: PopupInfo, auto_dismiss: bool) {
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
     if auto_dismiss {
-        let _ = SetTimer(Some(hwnd), 1, AUTO_DISMISS_MS, None);
-        log(&format!("popup created auto_dismiss=true hwnd={:?}", hwnd));
-    } else {
-        log(&format!("popup created auto_dismiss=false hwnd={:?}", hwnd));
+        let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
     }
+    // “跟进”轮询：用户直接在对应 workspace 里打字/操作 → 弹窗自动消失
+    let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
+    log(&format!(
+        "popup created auto_dismiss={} hwnd={:?}",
+        auto_dismiss, hwnd
+    ));
 }
 
 /// 按 agent 给一个柔和底色（一点点颜色）。
@@ -419,10 +450,24 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             LRESULT(0)
         }
         WM_TIMER => {
-            // 只在“5s 自动关闭”模式下响应定时器
+            let id = w.0 as usize;
             let ptr = GetWindowLongPtrW(hwnd as _, GWLP_USERDATA) as *mut PopupState;
-            if !ptr.is_null() && (*ptr).auto_dismiss {
-                let _ = DestroyWindow(hwnd);
+            if ptr.is_null() {
+                return LRESULT(0);
+            }
+            match id {
+                ID_TIMER_DISMISS => {
+                    if (*ptr).auto_dismiss {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+                ID_TIMER_FOLLOW => {
+                    if user_moved_into_workspace(&(*ptr).info) {
+                        log("follow: user entered workspace -> dismiss");
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+                _ => {}
             }
             LRESULT(0)
         }
