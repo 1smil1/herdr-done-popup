@@ -1,0 +1,11 @@
+id = "herdr-done-popup"
+name = "Herdr Done Popup"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Persistent desktop popup when an AI agent completes."
+platforms = ["windows"]
+
+[[events]]
+id = "completion-notifier-status"
+on = "pane.agent_status_changed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-done-popup.exe\" event"]
