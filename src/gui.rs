@@ -78,6 +78,7 @@ pub struct PopupInfo {
     pub agent: String,
     pub pane: String,
     pub workspace: String,
+    pub tab_id: String,
     pub snippet: String,
 }
 
@@ -168,9 +169,9 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, _w: WPARAM, l: L
 }
 
 /// 用户行为 → 弹窗策略：
-/// 1. 前台窗口是 herdr 且 正处于”同一 session 的焦点 workspace” → 抑制
-///    （不同 herdr / 不同 session / 不同 workspace → 都要提醒）
-/// 2. 5 秒内有键盘/鼠标输入 → 5s 自动关闭（别打断你打字）
+/// 1. 前台窗口是 herdr 且 同一 session + 同一 tab → 抑制
+///    （不同 herdr / 不同 session / 不同 workspace / 不同 tab → 都要提醒）
+/// 2. 5 秒内有键盘/鼠标输入 → 10s 自动关闭（别打断你打字）
 /// 3. 否则 → 一直显示（你正在别处干活，强制提醒）
 unsafe fn decide_mode(info: &PopupInfo) -> Decision {
     let foreground_herdr = foreground_is_herdr();
@@ -181,25 +182,30 @@ unsafe fn decide_mode(info: &PopupInfo) -> Decision {
         None
     };
     let same_session = parsed_session.as_deref() == Some(info.session.to_lowercase().as_str());
-    let focused_ws = if same_session {
-        focused_workspace_in(&info.session)
+    let workspace_id = info.pane.split(':').next().unwrap_or("").to_string();
+    let focused_tab = if same_session {
+        focused_tab_in(&info.session, &workspace_id)
     } else {
         None
     };
     let recent = last_input_recent();
     log(&format!(
-        "decide session={} pane={} fg_herdr={} fg_title={:?} parsed_session={:?} same_session={} focused_ws={:?} recent_input={}",
+        "decide session={} pane={} tab={} fg_herdr={} fg_title={:?} parsed_session={:?} same_session={} focused_tab={:?} recent_input={}",
         info.session,
         info.pane,
+        info.tab_id,
         foreground_herdr,
         title,
         parsed_session,
         same_session,
-        focused_ws,
+        focused_tab,
         recent
     ));
-    let workspace_id = info.pane.split(':').next().unwrap_or("").to_string();
-    if foreground_herdr && same_session && focused_ws.as_deref() == Some(workspace_id.as_str()) {
+    if foreground_herdr
+        && same_session
+        && !info.tab_id.is_empty()
+        && focused_tab.as_deref() == Some(info.tab_id.as_str())
+    {
         log("  -> SUPPRESS");
         Decision::Suppress
     } else if recent {
@@ -217,10 +223,6 @@ unsafe fn should_suppress(info: &PopupInfo) -> bool {
     }
     let title = foreground_title();
     let title_lc = title.to_lowercase();
-    // 解析前台窗口的 session 名：
-    //   * 标题里有 "--session X" → session = X
-    //   * 否则标题里有 "herdr" → session = default（裸 herdr 就是默认实例）
-    //   * 否则不算 herdr → 不抑制
     let parsed_session = parse_session_from_title(&title_lc);
     let parsed = match parsed_session {
         Some(s) => s,
@@ -229,12 +231,15 @@ unsafe fn should_suppress(info: &PopupInfo) -> bool {
     if parsed != info.session.to_lowercase() {
         return false;
     }
+    if info.tab_id.is_empty() {
+        return false;
+    }
     let workspace_id = info.pane.split(':').next().unwrap_or("");
     if workspace_id.is_empty() {
         return false;
     }
-    match focused_workspace_in(&info.session) {
-        Some(focused) => focused == workspace_id,
+    match focused_tab_in(&info.session, workspace_id) {
+        Some(focused) => focused == info.tab_id,
         None => false,
     }
 }
@@ -264,7 +269,7 @@ fn parse_session_from_title(title_lc: &str) -> Option<String> {
     Some("default".to_string())
 }
 
-/// 轮询：用户是不是已经“跟进”到了这个 popup 对应的 workspace？
+/// 轮询：用户是不是已经“跟进”到了这个 popup 对应的 tab？
 /// 是的话销毁 popup（说明用户已经看到并切过去处理了）。
 unsafe fn user_moved_into_workspace(info: &PopupInfo) -> bool {
     if !foreground_is_herdr() {
@@ -279,12 +284,15 @@ unsafe fn user_moved_into_workspace(info: &PopupInfo) -> bool {
     if parsed != info.session.to_lowercase() {
         return false;
     }
+    if info.tab_id.is_empty() {
+        return false;
+    }
     let workspace_id = info.pane.split(':').next().unwrap_or("");
     if workspace_id.is_empty() {
         return false;
     }
-    match focused_workspace_in(&info.session) {
-        Some(focused) => focused == workspace_id,
+    match focused_tab_in(&info.session, workspace_id) {
+        Some(focused) => focused == info.tab_id,
         None => false,
     }
 }
@@ -314,6 +322,23 @@ unsafe fn focused_workspace_in(session: &str) -> Option<String> {
     find_focused_workspace_id(&v)
 }
 
+unsafe fn focused_tab_in(session: &str, workspace_id: &str) -> Option<String> {
+    let out = Command::new("herdr")
+        .args([
+            "--session",
+            session,
+            "tab",
+            "list",
+            "--workspace",
+            workspace_id,
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(&text).ok()?;
+    find_focused_tab_id(&v)
+}
+
 fn find_focused_workspace_id(v: &Value) -> Option<String> {
     match v {
         Value::Object(map) => {
@@ -332,6 +357,33 @@ fn find_focused_workspace_id(v: &Value) -> Option<String> {
         Value::Array(arr) => {
             for val in arr {
                 if let Some(f) = find_focused_workspace_id(val) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn find_focused_tab_id(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            let id = map.get("tab_id").and_then(|s| s.as_str());
+            let focused = map.get("focused").and_then(|s| s.as_bool()).unwrap_or(false);
+            if focused && id.is_some() {
+                return id.map(|s| s.to_string());
+            }
+            for val in map.values() {
+                if let Some(f) = find_focused_tab_id(val) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                if let Some(f) = find_focused_tab_id(val) {
                     return Some(f);
                 }
             }
@@ -364,10 +416,10 @@ unsafe fn create_popup(owner: HWND, info: PopupInfo, auto_dismiss: bool) {
     };
     let _ = GetMonitorInfoW(monitor, &mut mi);
     let r = mi.rcWork;
-    // 从右往左并排，新完成的在最右
+    // 从下往上堆叠（多 pane 时新完成的在最下）
     let slot = ACTIVE_COUNT.fetch_add(1, Ordering::SeqCst);
-    let x = r.right - POPUP_W - MARGIN - (POPUP_W + GAP) * slot as i32;
-    let y = r.bottom - POPUP_H - MARGIN;
+    let x = r.right - POPUP_W - MARGIN;
+    let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot as i32;
     let class = wide("HerdrDonePopup");
     let data = Box::new(PopupState { info, auto_dismiss });
     let ptr = Box::into_raw(data);
@@ -462,9 +514,18 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                     }
                 }
                 ID_TIMER_FOLLOW => {
-                    if user_moved_into_workspace(&(*ptr).info) {
+                    let state = &mut *ptr;
+                    // 1. 用户已切到对应 workspace → 立即销毁
+                    if user_moved_into_workspace(&state.info) {
                         log("follow: user entered workspace -> dismiss");
                         let _ = DestroyWindow(hwnd);
+                        return LRESULT(0);
+                    }
+                    // 2. PERMANENT 模式 + 用户现在活跃 → 升级为 10s 自动关闭
+                    if !state.auto_dismiss && last_input_recent() {
+                        state.auto_dismiss = true;
+                        let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
+                        log("follow: user became active -> start 10s dismiss");
                     }
                 }
                 _ => {}

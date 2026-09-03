@@ -182,6 +182,7 @@ fn run_receiver() {
 
 #[derive(Clone, Default)]
 struct PaneMeta {
+    tab_id: String,
     tab_label: String,
     pane_label: String,
 }
@@ -245,6 +246,7 @@ fn handle_conn(
                 agent: agent.to_string(),
                 pane: pane.to_string(),
                 workspace,
+                tab_id: meta.tab_id,
                 snippet,
             });
         }
@@ -315,6 +317,7 @@ fn resolve_pane_meta(
         let entry = cache
             .entry((session.to_string(), pid.clone()))
             .or_default();
+        entry.tab_id = tab_id.clone();
         entry.pane_label = pane_label.clone();
         if let Some(t) = tab_labels.get(tab_id) {
             entry.tab_label = t.clone();
