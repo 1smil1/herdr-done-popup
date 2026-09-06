@@ -61,6 +61,8 @@ pub struct PopupInfo {
     pub workspace: String,
     pub tab_id: String,
     pub snippet: String,
+    /// true = agent 处于 blocked（提问/等批准），需要用户回应
+    pub blocked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -417,14 +419,20 @@ unsafe fn paint_popup(hwnd: HWND) {
     let _ = GetClientRect(hwnd, &mut rc);
 
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupState;
-    let (agent, workspace, snippet) = if !ptr.is_null() {
+    let (agent, workspace, snippet, blocked) = if !ptr.is_null() {
         let info = &(*ptr).info;
-        (info.agent.as_str(), info.workspace.as_str(), info.snippet.as_str())
+        (info.agent.as_str(), info.workspace.as_str(), info.snippet.as_str(), info.blocked)
     } else {
-        ("", "", "")
+        ("", "", "", false)
     };
 
-    let bg = CreateSolidBrush(color_for_agent(agent));
+    // blocked（等输入）用暗红底色 + 标记，和普通完成区分开。
+    let bg_color = if blocked {
+        COLORREF(0x002E3BA0) // BGR: 砖红 #A03B2E
+    } else {
+        color_for_agent(agent)
+    };
+    let bg = CreateSolidBrush(bg_color);
     FillRect(hdc, &rc, bg);
 
     SetBkMode(hdc, TRANSPARENT);
@@ -437,7 +445,12 @@ unsafe fn paint_popup(hwnd: HWND) {
         right: rc.right - CLOSE_W - 6,
         bottom: rc.top + 34,
     };
-    let mut titlew = wide(&format!("{} · {}", agent, workspace));
+    let title = if blocked {
+        format!("{} · {} · 等待输入", agent, workspace)
+    } else {
+        format!("{} · {}", agent, workspace)
+    };
+    let mut titlew = wide(&title);
     titlew.pop();
     let _ = DrawTextW(hdc, &mut titlew, &mut tr, DT_VCENTER | DT_SINGLELINE);
 

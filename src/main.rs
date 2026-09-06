@@ -58,8 +58,8 @@ fn run_event() -> i32 {
     let Some(status) = find_str(&root, &["status", "state", "agent_status", "agentStatus"]) else {
         return 0;
     };
-    // 只在 idle/done 上弹窗；working 仅用于标记一次完成
-    if !matches!(status, "idle" | "done") {
+    // idle/done = 完成；blocked = agent 在提问/等批准，也必须提醒。
+    if !matches!(status, "idle" | "done" | "blocked") {
         return 0;
     }
 
@@ -76,6 +76,7 @@ fn run_event() -> i32 {
         workspace,
         tab_id: meta.tab_id,
         snippet,
+        blocked: status == "blocked",
     };
     run_popup(popup);
     0
