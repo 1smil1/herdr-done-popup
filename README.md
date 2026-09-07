@@ -147,10 +147,3 @@ README.md           this file
 - Windows (primary, tested)
 - macOS / Linux (declared in `platforms = ["macos", "linux", "windows"]`;
   needs someone to verify the Win32 `gui.rs` ports to GTK or similar)
-
-## Cross-references
-
-- `herdr-agent-quota` — the canonical "real" Herdr plugin this one's design
-  follows.
-- `herdr_right_click.ahk` — the user's existing AHK script for right-click
-  paste. Untouched by this plugin.
