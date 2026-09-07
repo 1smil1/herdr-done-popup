@@ -1,8 +1,8 @@
 # herdr-done-popup
 
 Standalone Herdr plugin that pops a desktop notification whenever an AI agent
-in any Herdr pane finishes a task. Independent of `herdr_right_click.ahk`
-and `herdr-agent-quota`.
+in any Herdr pane finishes a task or asks a question. Independent of
+`herdr_right_click.ahk` and `herdr-agent-quota`.
 
 ## What you get
 
@@ -11,6 +11,8 @@ and `herdr-agent-quota`.
 - Body: the first sentence of the agent's last output, truncated.
 - Right-top × closes the popup. Click anywhere else to focus that Herdr pane.
 - Multiple pane completions stack vertically.
+- **Blocked** state (agent asking a question) is shown in brick red with
+  `· 等待输入` suffix so it reads as "needs your answer".
 - Auto-dismiss after 10s if you've been typing in the last 5s; otherwise it
   stays until you click × or switch into the originating tab.
 
@@ -28,52 +30,57 @@ If the popup stays and you start typing in any window, it upgrades to
 "10s auto-dismiss". If you switch focus into the originating tab, it
 auto-dismisses immediately.
 
-## Install (one command)
+## Install (no daemon)
 
 ```powershell
 cd D:\herdr_done_popup
 .\install.ps1
 ```
 
-This builds the binary, then runs `herdr-done-popup.exe start` which:
-- discovers every existing Herdr session via `herdr session list`
-- runs `herdr plugin link` for each
-- polls every 10s for new sessions and links them too
+That's it. `./install.ps1` runs `cargo build --release` and then
+`herdr-done-popup start` which links the plugin to every currently running
+Herdr session. There's no background process to manage.
 
-The install script keeps running (the watcher). Leave it running in a
-terminal, or background it with `Start-Process` from another script.
-
-## Run / Stop
+If you create a new Herdr session later, run from inside it:
 
 ```powershell
-# Watcher (run once after install, or to recover from restart)
-D:\herdr_done_popup\target\release\herdr-done-popup.exe start
-
-# Inspect which sessions have us linked
-D:\herdr_done_popup\target\release\herdr-done-popup.exe status
-
-# Unlink from every session
-D:\herdr_done_popup\target\release\herdr-done-popup.exe stop
+herdr plugin install D:\herdr_done_popup
 ```
 
-To stop the watcher, kill the process:
+This triggers our `[[startup]]` action, which calls `herdr-done-popup start`
+to link to every session (including the new one). One command per new session.
+
+For a clean GitHub install (no `install.ps1` needed once it's published):
 
 ```powershell
-Get-Process herdr-done-popup | Stop-Process -Force
+herdr plugin install <owner>/<repo>
 ```
 
-## Per-event model
+`herdr` itself will clone the repo, run `cargo build --release` (via the
+`[[build]]` entry in `herdr-plugin.toml`), and enable the plugin. No
+official marketplace required — any public GitHub repo works.
 
-Each Herdr `pane.agent_status_changed` event spawns
-`herdr-done-popup.exe event` once. That process:
-1. Decides suppress-or-show based on foreground window + tab focus.
-2. Fetches the pane's first useful output line (via `herdr pane read
-   --source visible`).
-3. Counts existing popups to pick a vertical slot.
-4. Creates the rounded Win32 window and runs its own message loop.
-5. Exits when the user dismisses it.
+## CLI
 
-No TCP, no shared state, no separate long-running receiver.
+```
+herdr-done-popup install    one-time: cargo build --release (local dev)
+herdr-done-popup start      link to every current session
+herdr-done-popup stop       unlink from every session
+herdr-done-popup uninstall  stop + cargo clean + dir hint
+herdr-done-popup event      per-agent-event popup (herdr [[events]] only)
+```
+
+`event` and `start` are also fired by herdr itself — you don't normally
+call them by hand.
+
+## Uninstall
+
+```powershell
+.\uninstall.ps1
+```
+
+Unlinks from every Herdr session and removes `target/`. To fully delete the
+plugin, `Remove-Item -Recurse D:\herdr_done_popup`.
 
 ## Logs
 
@@ -84,9 +91,9 @@ and the final `SUPPRESS / AUTO10s / PERMANENT` outcome.
 
 ```
 Cargo.toml          Rust deps
-herdr-plugin.toml   herdr plugin manifest
+herdr-plugin.toml   herdr plugin manifest (build, startup, events)
 src/main.rs         CLI dispatch + session/content helpers
 src/gui.rs          Win32 popup, message loop, decision
 install.ps1         build + start
-uninstall.ps1       stop + unlink
+uninstall.ps1       stop + clean
 ```

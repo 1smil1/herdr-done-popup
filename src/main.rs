@@ -1,20 +1,20 @@
 #![cfg(windows)]
 // herdr-done-popup
 //
-// Per-event:  herdr-done-popup event         (one process per agent event; creates popup, exits)
-// Daemon:     herdr-done-popup start        (link to all sessions + watch for new ones)
-// Inspect:     herdr-done-popup status       (which sessions have us linked)
-// Detach:      herdr-done-popup stop         (unlink from all sessions)
+// One-shot commands, no daemons:
+//   herdr-done-popup event       <- herdr [[events]] (one process per agent event)
+//   herdr-done-popup install     <- cargo build --release (one-time, local dev)
+//   herdr-done-popup start       <- link to every current Herdr session
+//   herdr-done-popup stop        <- unlink from every Herdr session
+//   herdr-done-popup uninstall   <- stop + cargo clean + dir hint
 //
-// Each herdr [[events]] invocation runs `event` once. We fetch the pane's
-// first sentence, decide suppression / mode, draw the popup, and run a small
-// Win32 message loop until the user dismisses it. No TCP, no shared state.
+// `event` and `start` are also fired by Herdr itself: `event` from
+// [[events]], `start` from [[startup]] when the plugin is enabled in
+// any session. So you don't normally call them yourself.
 
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
 mod gui;
 use gui::{run_popup, PopupInfo, PaneMeta};
@@ -29,9 +29,13 @@ fn main() {
         [cmd] if cmd == "event" => std::process::exit(run_event()),
         [cmd] if cmd == "start" => run_start(),
         [cmd] if cmd == "stop" => run_stop(),
-        [cmd] if cmd == "status" => run_status(),
+        [cmd] if cmd == "install" => run_install(),
+        [cmd] if cmd == "uninstall" => run_uninstall(),
         other => {
-            eprintln!("usage: herdr-done-popup <event|start|stop|status>  (got: {:?})", other);
+            eprintln!(
+                "usage: herdr-done-popup <event|start|stop|install|uninstall>  (got: {:?})",
+                other
+            );
             std::process::exit(2);
         }
     }
@@ -82,44 +86,26 @@ fn run_event() -> i32 {
     0
 }
 
-/* =============================== daemon: start / stop / status =============================== */
+/* =============================== start / stop / install / uninstall =============================== */
 
+/// `start` links the plugin into every currently-running Herdr session.
+/// One-shot, returns immediately. Also called automatically by herdr via
+/// the [[startup]] action when the plugin is enabled in any session.
 fn run_start() {
     let sessions = list_sessions();
     if sessions.is_empty() {
         eprintln!("start: no sessions found (is herdr running?)");
-        std::process::exit(1);
+        return;
     }
-    let mut linked: HashSet<String> = HashSet::new();
     for s in &sessions {
         match link_session(s) {
-            Ok(_) => {
-                linked.insert(s.clone());
-                eprintln!("start: linked to session `{}`", s);
-            }
+            Ok(_) => eprintln!("start: linked to `{}`", s),
             Err(e) => eprintln!("start: failed to link `{}`: {}", s, e),
         }
     }
     eprintln!(
-        "start: watching {} session(s); poll every 10s. Press Ctrl+C to stop.",
-        sessions.len()
+        "start: done. If you create a new session later, run `herdr plugin install <owner>/<repo>` (or `herdr-done-popup start`) once in it."
     );
-    // Watch for new sessions and link them too.
-    loop {
-        std::thread::sleep(Duration::from_secs(10));
-        let current = list_sessions();
-        for s in current {
-            if !linked.contains(&s) {
-                match link_session(&s) {
-                    Ok(_) => {
-                        eprintln!("start: linked new session `{}`", s);
-                        linked.insert(s);
-                    }
-                    Err(e) => eprintln!("start: failed to link new `{}`: {}", s, e),
-                }
-            }
-        }
-    }
 }
 
 fn run_stop() {
@@ -130,19 +116,53 @@ fn run_stop() {
             Err(e) => eprintln!("stop: failed to unlink `{}`: {}", s, e),
         }
     }
-    eprintln!("stop: done. (the watcher process needs to be killed separately)");
+    eprintln!("stop: done. The plugin binary is still on disk; run `uninstall` to clean up.");
 }
 
-fn run_status() {
+/// `install` runs `cargo build --release` so a developer working from
+/// a local clone has the binary ready for `herdr plugin link <path>`.
+/// End users normally don't run this; `herdr plugin install` builds
+/// from source via the [[build]] entry in herdr-plugin.toml.
+fn run_install() {
+    let root = plugin_root();
+    println!("install: building release binary in {}/target/release/ ...", root.display());
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&root)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            let exe = root.join("target").join("release").join(exe_name());
+            println!("install: built {}", exe.display());
+            println!();
+            println!("next step (one of):");
+            println!("  herdr plugin link {}", root.display());
+            println!("  herdr-done-popup start    # link to every session you have right now");
+        }
+        Ok(s) => {
+            eprintln!("install: cargo build failed (exit {:?})", s.code());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("install: failed to spawn cargo: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_uninstall() {
+    // 1. Unlink from every session.
     let sessions = list_sessions();
-    if sessions.is_empty() {
-        println!("no sessions found");
-        return;
+    for s in &sessions {
+        let _ = unlink_session(s);
     }
-    for s in sessions {
-        let linked = session_has_plugin(&s);
-        println!("  {:<12} {}", s, if linked { "linked" } else { "not linked" });
+    // 2. Best-effort clean of build artefacts.
+    let target = plugin_root().join("target");
+    if target.exists() {
+        let _ = std::fs::remove_dir_all(&target);
     }
+    println!("uninstall: unlinked from all sessions and removed target/.");
+    println!("To fully remove the plugin, delete the directory: {}", plugin_root().display());
 }
 
 /* =============================== session management =============================== */
@@ -241,18 +261,6 @@ fn unlink_session(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn session_has_plugin(name: &str) -> bool {
-    let out = match Command::new("herdr")
-        .args(["--session", name, "plugin", "list"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.contains(PLUGIN_ID)
-}
-
 fn plugin_root() -> PathBuf {
     if let Some(root) = std::env::var_os("HERDR_PLUGIN_ROOT") {
         return PathBuf::from(root);
@@ -266,6 +274,14 @@ fn plugin_root() -> PathBuf {
         }
     }
     PathBuf::from(".")
+}
+
+fn exe_name() -> &'static str {
+    if cfg!(windows) {
+        "herdr-done-popup.exe"
+    } else {
+        "herdr-done-popup"
+    }
 }
 
 /* =============================== session from socket =============================== */
