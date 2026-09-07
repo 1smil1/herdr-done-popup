@@ -568,7 +568,7 @@ unsafe fn activate_herdr_host(session: &str) {
     if !target.0.is_null() {
         // 只在最小化时还原，maximized / normal 不动。SW_RESTORE 对
         // maximized 窗口会强行改为 normal 尺寸，这会违反"保持原状"。
-        if IsIconic(target) {
+        if IsIconic(target).as_bool() {
             let _ = ShowWindow(target, SW_RESTORE);
         }
         let _ = BringWindowToTop(target);
