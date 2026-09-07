@@ -2,19 +2,17 @@ $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $Exe = Join-Path $Root 'target\release\herdr-done-popup.exe'
 
-# Build the binary (herdr-plugin.toml's [[build]] does the same on the
-# user's machine when they run `herdr plugin install`).
-Push-Location $Root
-try { cargo build --release } finally { Pop-Location }
-if (-not (Test-Path $Exe)) { throw "Build did not produce $Exe" }
-
-# Activate in every currently running Herdr session.
-# `herdr plugin link` is per-session, so we loop and link each.
-& $Exe start
+# One-time permanent setup: build + link everywhere.
+& $Exe install
 
 Write-Host ""
-Write-Host "Installed. To activate in a brand-new Herdr session later, run from inside it:"
-Write-Host "  herdr plugin install $Root"
-Write-Host "Or to link to all sessions in one go:"
+Write-Host "Installed (linked but not enabled). To turn it on:"
 Write-Host "  $Exe start"
+Write-Host "To turn off (keeps it linked):"
+Write-Host "  $Exe stop"
+Write-Host "To fully remove:"
+Write-Host "  $Exe uninstall"
+Write-Host "For new Herdr sessions later, just run inside them:"
+Write-Host "  herdr plugin install $Root"
+Write-Host "  -- our [[startup]] action will call `start` for you."
 Write-Host "Existing herdr_right_click.ahk was not changed."

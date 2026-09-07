@@ -88,9 +88,10 @@ fn run_event() -> i32 {
 
 /* =============================== start / stop / install / uninstall =============================== */
 
-/// `start` links the plugin into every currently-running Herdr session.
-/// One-shot, returns immediately. Also called automatically by herdr via
-/// the [[startup]] action when the plugin is enabled in any session.
+/// `start` enables the plugin in every currently-running Herdr session.
+/// Plugin must already be linked (i.e. `install` or `herdr plugin install`
+/// has been run). One-shot. Also fired automatically by herdr via the
+/// [[startup]] action so new sessions get the plugin enabled everywhere.
 fn run_start() {
     let sessions = list_sessions();
     if sessions.is_empty() {
@@ -98,47 +99,41 @@ fn run_start() {
         return;
     }
     for s in &sessions {
-        match link_session(s) {
-            Ok(_) => eprintln!("start: linked to `{}`", s),
-            Err(e) => eprintln!("start: failed to link `{}`: {}", s, e),
+        match enable_session(s) {
+            Ok(true) => eprintln!("start: enabled in `{}`", s),
+            Ok(false) => eprintln!("start: `{}` not linked yet (run `install` first or `herdr plugin install <owner>/<repo>`)", s),
+            Err(e) => eprintln!("start: failed for `{}`: {}", s, e),
         }
     }
-    eprintln!(
-        "start: done. If you create a new session later, run `herdr plugin install <owner>/<repo>` (or `herdr-done-popup start`) once in it."
-    );
+    eprintln!("start: done.");
 }
 
+/// `stop` disables the plugin in every session. The plugin stays linked;
+/// run `start` again to re-enable, or `uninstall` to remove entirely.
 fn run_stop() {
     let sessions = list_sessions();
     for s in &sessions {
-        match unlink_session(s) {
-            Ok(_) => eprintln!("stop: unlinked `{}`", s),
-            Err(e) => eprintln!("stop: failed to unlink `{}`: {}", s, e),
+        match disable_session(s) {
+            Ok(_) => eprintln!("stop: disabled in `{}`", s),
+            Err(e) => eprintln!("stop: failed for `{}`: {}", s, e),
         }
     }
-    eprintln!("stop: done. The plugin binary is still on disk; run `uninstall` to clean up.");
+    eprintln!("stop: done. Plugin is still linked; run `start` to re-enable, `uninstall` to remove.");
 }
 
-/// `install` runs `cargo build --release` so a developer working from
-/// a local clone has the binary ready for `herdr plugin link <path>`.
-/// End users normally don't run this; `herdr plugin install` builds
-/// from source via the [[build]] entry in herdr-plugin.toml.
+/// `install` is the one-time permanent setup: build the binary, then
+/// link + enable in every current session. End users running from a
+/// GitHub release use `herdr plugin install <owner>/<repo>` instead —
+/// that command does the same thing plus clones the repo.
 fn run_install() {
     let root = plugin_root();
     println!("install: building release binary in {}/target/release/ ...", root.display());
-    let status = Command::new("cargo")
+    match Command::new("cargo")
         .args(["build", "--release"])
         .current_dir(&root)
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            let exe = root.join("target").join("release").join(exe_name());
-            println!("install: built {}", exe.display());
-            println!();
-            println!("next step (one of):");
-            println!("  herdr plugin link {}", root.display());
-            println!("  herdr-done-popup start    # link to every session you have right now");
-        }
+        .status()
+    {
+        Ok(s) if s.success() => {}
         Ok(s) => {
             eprintln!("install: cargo build failed (exit {:?})", s.code());
             std::process::exit(1);
@@ -148,6 +143,22 @@ fn run_install() {
             std::process::exit(1);
         }
     }
+    let exe = root.join("target").join("release").join(exe_name());
+    println!("install: built {}", exe.display());
+
+    let sessions = list_sessions();
+    if sessions.is_empty() {
+        println!("install: no running herdr sessions; nothing to link.");
+        return;
+    }
+    for s in &sessions {
+        match link_session(s) {
+            Ok(_) => eprintln!("install: linked `{}`", s),
+            Err(e) => eprintln!("install: failed to link `{}`: {}", s, e),
+        }
+    }
+    println!();
+    println!("install: done. Plugin is linked everywhere. Run `herdr-done-popup start` to enable.");
 }
 
 fn run_uninstall() {
@@ -237,6 +248,38 @@ fn link_session(name: &str) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("herdr plugin link exited with {:?}", status.code()),
+        ));
+    }
+    let _ = Command::new("herdr")
+        .args(["--session", name, "server", "reload-config"])
+        .status();
+    Ok(())
+}
+
+/// Returns Ok(true) if enabled, Ok(false) if not linked, Err on herdr failure.
+fn enable_session(name: &str) -> std::io::Result<bool> {
+    let status = Command::new("herdr")
+        .args(["--session", name, "plugin", "enable", PLUGIN_ID])
+        .status()?;
+    if !status.success() {
+        // herdr returns non-zero when the plugin isn't linked yet; treat that
+        // as "not linked" rather than a hard error so callers can warn.
+        return Ok(false);
+    }
+    let _ = Command::new("herdr")
+        .args(["--session", name, "server", "reload-config"])
+        .status();
+    Ok(true)
+}
+
+fn disable_session(name: &str) -> std::io::Result<()> {
+    let status = Command::new("herdr")
+        .args(["--session", name, "plugin", "disable", PLUGIN_ID])
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("herdr plugin disable exited with {:?}", status.code()),
         ));
     }
     let _ = Command::new("herdr")
