@@ -488,11 +488,14 @@ unsafe fn open_target(hwnd: HWND) {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupState;
     if !ptr.is_null() {
         let info = &(*ptr).info;
-        // herdr 自己负责把对应 session 的 host 窗口 + pane 拉到前台，并保持
-        // 窗口当前状态（不还原/不最大化）。我们不再额外做 ShowWindow 之类的
-        // 窗口操作，避免错误命中别的 herdr 窗口。
-        let _ = Command::new("herdr")
-            .args(["--session", &info.session, "agent", "focus", &info.pane])
+        // pane focus 才会真的把 herdr host 窗口拉到前台 + 切到对应 pane。
+        // agent focus 只是逻辑上"标记已看到"，不会动窗口。
+        let pane = info.pane.clone();
+        let session = info.session.clone();
+        // 释放 GWLP_USERDATA 之前先读出 session/pane，避免冲突。
+        // herdr --session X pane focus <pane_id> 同步等待完成。
+        let _ = std::process::Command::new("herdr")
+            .args(["--session", &session, "pane", "focus", &pane])
             .status();
     }
     let _ = DestroyWindow(hwnd);
