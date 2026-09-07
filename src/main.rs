@@ -157,8 +157,16 @@ fn run_install() {
             Err(e) => eprintln!("install: failed to link `{}`: {}", s, e),
         }
     }
+    // Also enable everywhere, so `install` alone is enough to go from
+    // nothing to a fully working setup. Subsequent `start` calls are
+    // idempotent and cheap.
+    println!("install: enabling in all sessions...");
+    for s in &sessions {
+        let _ = enable_session(s);
+    }
     println!();
-    println!("install: done. Plugin is linked everywhere. Run `herdr-done-popup start` to enable.");
+    println!("install: done. Plugin is linked and enabled everywhere.");
+    println!("To turn it off later: `herdr-done-popup stop`. To re-enable: `start`.");
 }
 
 fn run_uninstall() {
