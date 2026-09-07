@@ -1,95 +1,156 @@
 # herdr-done-popup
 
-Standalone Herdr plugin that pops a desktop notification whenever an AI agent
-in any Herdr pane finishes a task or asks a question. Independent of
-`herdr_right_click.ahk` and `herdr-agent-quota`.
+A desktop popup for Herdr that tells you the moment an AI agent in any pane
+finishes — or asks you a question.
 
-## What you get
+It is independent of `herdr_right_click.ahk` and `herdr-agent-quota`. It has
+no background process: every command exits as soon as it finishes.
 
-- A 300x82 rounded "pill" window at the right-bottom of your active monitor.
-- Title: `agent · tab_label · pane_label` (so you always know which pane).
-- Body: the first sentence of the agent's last output, truncated.
-- Right-top × closes the popup. Click anywhere else to focus that Herdr pane.
-- Multiple pane completions stack vertically.
-- **Blocked** state (agent asking a question) is shown in brick red with
-  `· 等待输入` suffix so it reads as "needs your answer".
-- Auto-dismiss after 10s if you've been typing in the last 5s; otherwise it
-  stays until you click × or switch into the originating tab.
+## What you see
 
-## Suppression: only when you can already see the completion
+A 300×82 rounded "pill" appears at the right-bottom of your active monitor:
 
-When the popup event fires, we suppress only if all of these are true:
+```
+claude · herdr · 测试tab1            ×
+等你的结果。
+```
+
+- **Title** — `agent · workspace_label · tab_label · pane_label` so you always
+  know which pane finished.
+- **Body** — the first useful sentence of the agent's last output (truncated).
+- **Right-top ×** — dismiss.
+- **Click anywhere else** — focus that Herdr pane (does not change the window's
+  minimized / maximized / normal state).
+
+If the agent is **asking you something** (blocked state) the pill turns brick
+red and the title gets a `· 等待输入` suffix so it reads as "needs your answer"
+at a glance.
+
+If multiple agents complete at the same time, the pills stack vertically at
+the right edge.
+
+## When does the popup show / stay / go away?
+
+The popup event fires on every `pane.agent_status_changed` for your Herdr
+sessions. We **suppress** it only if all of these are true:
+
 - The foreground window is a Herdr window
 - It belongs to the same Herdr session as the completion
 - The user's focused tab in that session is the same tab as the completion
 
-Anything else (different Herdr, different session, different workspace,
-different tab) → popup shows.
+Anything else (different Herdr / different session / different workspace /
+different tab) → the popup shows.
 
-If the popup stays and you start typing in any window, it upgrades to
-"10s auto-dismiss". If you switch focus into the originating tab, it
-auto-dismisses immediately.
+If the popup is up and you start typing anywhere, it auto-dismisses in 10s.
+If you switch focus into the originating tab, it dismisses immediately. If you
+just leave it alone, it stays until you click × or focus the originating tab.
 
-## Install / start / stop / uninstall (no daemon)
+## Install
 
-```powershell
-cd D:\herdr_done_popup
-.\install.ps1      # one-time: build + link in every Herdr session
-herdr-done-popup start    # turn on the plugin (enable everywhere)
-herdr-done-popup stop     # turn off (disable; still linked)
-herdr-done-popup uninstall  # unlink everywhere + clean
-```
-
-`install` is permanent: it builds the binary and registers it with Herdr.
-`start` / `stop` are the daily-use toggle. `uninstall` removes everything.
-
-There is **no background process**. Each command exits as soon as it's done.
-
-## New Herdr sessions
-
-When you create a new Herdr session, run from inside it:
+### One command, no daemon
 
 ```powershell
-herdr plugin install D:\herdr_done_popup
+git clone https://github.com/<owner>/herdr-done-popup
+cd herdr-done-popup
+.\install.ps1
 ```
 
-This triggers our `[[startup]]` action, which calls `herdr-done-popup start`
-to enable the plugin in every session (including the new one). One command
-per new session.
+That's it. `./install.ps1` builds the release binary, then links it into every
+currently-running Herdr session and enables it. No background process to
+manage, no Windows service to install.
 
-## GitHub install (after publishing)
+You can also do it from a fresh Herdr session:
 
 ```powershell
 herdr plugin install <owner>/<repo>
 ```
 
-Herdr clones the repo, runs `cargo build --release` (via the `[[build]]` entry
-in `herdr-plugin.toml`), and enables the plugin. No official marketplace
-required — any public GitHub repo works.
+`herdr` itself clones the repo, runs `cargo build --release` (via the
+`[[build]]` entry in `herdr-plugin.toml`), and enables the plugin. Any
+public GitHub repo works — no official marketplace needed.
 
-## Per-event model
+## New Herdr sessions
 
-Each Herdr `pane.agent_status_changed` event spawns
-`herdr-done-popup.exe event` once. That process:
-1. Decides SUPPRESS / AUTO10s / PERMANENT based on foreground window + tab focus.
-2. Fetches the pane's first useful output line (via `herdr pane read
-   --source visible`).
-3. Counts existing popups via EnumWindows to pick a vertical slot.
-4. Creates the rounded Win32 window and runs its own message loop.
-5. Exits when the user dismisses it.
+When you create a new Herdr session later, run this from inside it:
 
-## Logs
+```powershell
+herdr plugin install <owner>/<repo>
+```
+
+That one command:
+
+1. Clones (or just links) the plugin in the new session.
+2. Builds and links it.
+3. Triggers our `[[startup]]` action, which calls `herdr-done-popup start` to
+   ensure the plugin is **enabled in every Herdr session**, not just the new
+   one. So the new session is automatically wired up everywhere.
+
+## Daily use
+
+```powershell
+herdr-done-popup stop       # pause: disable everywhere (plugin stays linked)
+herdr-done-popup start      # resume: enable everywhere
+```
+
+Both are idempotent and instant. `start` is also auto-fired by `[[startup]]`,
+so you rarely need to call it yourself.
+
+## Uninstall
+
+```powershell
+.\uninstall.ps1
+# then delete the cloned directory
+Remove-Item -Recurse .\herdr-done-popup
+```
+
+Unlinks from every Herdr session, removes the build output, and tells you
+how to delete the directory.
+
+## Inspect
+
+```powershell
+# Which plugins are linked in the current session?
+herdr plugin list
+
+# How many sessions exist?
+herdr session list
+```
+
+## Logging
 
 `%TEMP%\herdr-done-popup.log` — one line per event with the decision inputs
-and the final `SUPPRESS / AUTO10s / PERMANENT` outcome.
+and the final outcome (`SUPPRESS / AUTO10s / PERMANENT`). Open it to find out
+why a popup did or didn't show.
 
-## Files
+## Plugin manifest (herdr-plugin.toml)
+
+| Hook | Command | When |
+|---|---|---|
+| `[[build]]` | `cargo build --release` | `herdr plugin install` |
+| `[[startup]]` | `herdr-done-popup start` | Plugin enabled in any session |
+| `[[events]]` | `herdr-done-popup event` | `pane.agent_status_changed` fires |
+
+## Files in this repo
 
 ```
 Cargo.toml          Rust deps
-herdr-plugin.toml   herdr plugin manifest (build, startup, events)
-src/main.rs         CLI dispatch + session/content helpers
-src/gui.rs          Win32 popup, message loop, decision
-install.ps1         one-time setup: build + link
-uninstall.ps1       unlink + clean
+herdr-plugin.toml   Herdr plugin manifest
+src/main.rs         CLI dispatch + helpers (session, snippet, JSON, ANSI)
+src/gui.rs          Win32 popup window, message loop, decision logic
+install.ps1         Windows convenience: build + link + enable everywhere
+uninstall.ps1       Windows convenience: unlink + clean
+README.md           this file
 ```
+
+## Supported platforms
+
+- Windows (primary, tested)
+- macOS / Linux (declared in `platforms = ["macos", "linux", "windows"]`;
+  needs someone to verify the Win32 `gui.rs` ports to GTK or similar)
+
+## Cross-references
+
+- `herdr-agent-quota` — the canonical "real" Herdr plugin this one's design
+  follows.
+- `herdr_right_click.ahk` — the user's existing AHK script for right-click
+  paste. Untouched by this plugin.
