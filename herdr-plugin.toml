@@ -2,10 +2,17 @@ id = "herdr-done-popup"
 name = "Herdr Done Popup"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
-description = "Persistent desktop popup when an AI agent completes."
-platforms = ["windows"]
+description = "Persistent desktop popup when an AI agent in any Herdr pane completes a task or asks a question."
+platforms = ["macos", "linux", "windows"]
+
+# Built by `herdr plugin install <owner>/<repo>` from source on the user's
+# machine. The produced binary is invoked as `$HERDR_PLUGIN_ROOT/target/release/herdr-done-popup`
+# (no extension on macOS / Linux, .exe on Windows).
+[[build]]
+command = ["cargo", "build", "--release"]
 
 [[events]]
 id = "completion-notifier-status"
 on = "pane.agent_status_changed"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-done-popup.exe\" event"]
+# Per-event: spawn one process, draw popup, run message loop until user dismisses.
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-done-popup\" event"]
