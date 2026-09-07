@@ -337,7 +337,10 @@ fn exe_name() -> &'static str {
 
 /* =============================== session from socket =============================== */
 
-/// `C:\Users\...\sessions\dse\herdr.sock` -> "dse"；否则 "default"
+/// `C:\Users\<you>\AppData\Roaming\herdr\herdr.sock` -> "default"
+/// `C:\Users\<you>\AppData\Roaming\herdr\sessions\<NAME>\herdr.sock` -> "<NAME>"
+/// Same shape on macOS / Linux: the directory immediately under
+/// `sessions/` is the session name. Anything else falls back to "default".
 fn session_from_socket(socket: &str) -> String {
     let p = std::path::Path::new(socket);
     let components: Vec<_> = p
@@ -404,7 +407,7 @@ fn fetch_snippet(session: &str, pane: &str) -> String {
         let clean = strip_ansi(line);
         let trimmed = clean.trim();
         if trimmed.is_empty()
-            || is_claude_chrome(trimmed)
+            || is_agent_tui_chrome(trimmed)
             || is_prompt(trimmed)
             || is_input_or_done(trimmed)
         {
@@ -589,7 +592,10 @@ fn truncate_chars(s: &str, n: usize) -> String {
     out
 }
 
-fn is_claude_chrome(trimmed: &str) -> bool {
+/// Filter noise from a Claude-Code-style TUI (which is also what Codex,
+/// OpenCode and friends use). Drop dividers, the bottom status bar,
+/// the input prompt, the "Baked for Ns · done" completion line, etc.
+fn is_agent_tui_chrome(trimmed: &str) -> bool {
     let lower = trimmed.to_lowercase();
     trimmed.starts_with('─')
         || trimmed.starts_with('❯')
