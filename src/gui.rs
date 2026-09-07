@@ -20,7 +20,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINF
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EnumWindows, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowTextW, IsWindowVisible, LoadCursorW, MSG, PeekMessageW,
+    GetWindowLongPtrW, GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW, MSG, PeekMessageW,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, PM_REMOVE, SW_RESTORE,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ERASEBKGND,
@@ -566,7 +566,11 @@ unsafe fn activate_herdr_host(session: &str) {
     let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
     target = pair.2;
     if !target.0.is_null() {
-        let _ = ShowWindow(target, SW_RESTORE);
+        // 只在最小化时还原，maximized / normal 不动。SW_RESTORE 对
+        // maximized 窗口会强行改为 normal 尺寸，这会违反"保持原状"。
+        if IsIconic(target) {
+            let _ = ShowWindow(target, SW_RESTORE);
+        }
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
     }
