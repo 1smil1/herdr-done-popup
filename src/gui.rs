@@ -557,6 +557,9 @@ unsafe fn activate_herdr_host(session: &str) {
     let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
     target = pair.1;
     if !target.0.is_null() {
+        // 如果宿主窗口被最小化，先还原（SW_RESTORE 不会改 maximized/normal
+        // 状态，只对 minimized 起作用）。然后再置顶。
+        let _ = ShowWindow(target, SW_RESTORE);
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
     }
