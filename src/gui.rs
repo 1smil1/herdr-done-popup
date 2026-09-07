@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowTextW, IsWindowVisible, LoadCursorW, MSG, PeekMessageW,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, PM_REMOVE, SW_RESTORE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ERASEBKGND,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ERASEBKGND,
     WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WNDPROC,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
@@ -260,7 +260,7 @@ unsafe fn create_popup(info: PopupInfo, auto_dismiss: bool) {
     let state = Box::new(PopupState { info, auto_dismiss });
     let ptr = Box::into_raw(state);
     let hwnd = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         PCWSTR(class.as_ptr()),
         PCWSTR(class.as_ptr()),
         WS_POPUP | WS_VISIBLE,
@@ -279,15 +279,18 @@ unsafe fn create_popup(info: PopupInfo, auto_dismiss: bool) {
     };
     let rgn = CreateRoundRectRgn(0, 0, POPUP_W, POPUP_H, ROUND, ROUND);
     let _ = SetWindowRgn(hwnd, Some(rgn), true);
+    // 强制把 popup 拉到最上层 + 抢焦点，否则浏览器/全屏应用可能盖在它之上。
     let _ = SetWindowPos(
         hwnd,
         Some(HWND_TOPMOST),
-        x,
-        y,
-        POPUP_W,
-        POPUP_H,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
     );
+    let _ = BringWindowToTop(hwnd);
+    let _ = SetForegroundWindow(hwnd);
     if auto_dismiss {
         let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
     }
