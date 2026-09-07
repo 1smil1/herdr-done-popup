@@ -488,42 +488,14 @@ unsafe fn open_target(hwnd: HWND) {
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupState;
     if !ptr.is_null() {
         let info = &(*ptr).info;
+        // herdr 自己负责把对应 session 的 host 窗口 + pane 拉到前台，并保持
+        // 窗口当前状态（不还原/不最大化）。我们不再额外做 ShowWindow 之类的
+        // 窗口操作，避免错误命中别的 herdr 窗口。
         let _ = Command::new("herdr")
             .args(["--session", &info.session, "agent", "focus", &info.pane])
             .status();
-        activate_herher_window(&info.session);
     }
     let _ = DestroyWindow(hwnd);
-}
-
-unsafe fn activate_herher_window(session: &str) {
-    let needle = if session == "default" {
-        "herdr".to_lowercase()
-    } else {
-        format!("herdr --session {}", session).to_lowercase()
-    };
-    let mut target: HWND = HWND(std::ptr::null_mut());
-    extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
-        unsafe {
-            let data = &mut *(l.0 as *mut (String, HWND));
-            let mut buf = [0u16; 512];
-            let n = GetWindowTextW(hwnd, &mut buf) as usize;
-            let title = String::from_utf16_lossy(&buf[..n]).to_lowercase();
-            if IsWindowVisible(hwnd).as_bool() && title.contains(&data.0) {
-                data.1 = hwnd;
-                return BOOL(0);
-            }
-            BOOL(1)
-        }
-    }
-    let mut pair = (needle, target);
-    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
-    target = pair.1;
-    if !target.0.is_null() {
-        let _ = ShowWindow(target, SW_RESTORE);
-        let _ = BringWindowToTop(target);
-        let _ = SetForegroundWindow(target);
-    }
 }
 
 /* =============================== helpers =============================== */
