@@ -515,20 +515,22 @@ unsafe fn open_target(hwnd: HWND) {
 }
 
 /// Bring the herdr host window to the foreground for the given session.
-/// Preserves the window's existing state (no SW_RESTORE).
+/// `default` sessions are identified by titles that contain "herdr" but
+/// NOT "--session" (the warp window for a default herdr is titled just
+/// "herdr" or "◑ herdr-..."). Named sessions contain both "herdr" and
+/// "--session <name>".
 unsafe fn activate_herdr_host(session: &str) {
-    let needle_session = if session == "default" {
-        // Default herdr has no "--session" flag in the title, so just look
-        // for any visible window whose title starts with "herdr".
-        String::new()
-    } else {
+    let must_have_session = session != "default";
+    let required_token = if must_have_session {
         format!("--session {}", session)
+    } else {
+        String::new()
     };
     let mut target: HWND = HWND(std::ptr::null_mut());
     extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
         unsafe {
-            let data = &mut *(l.0 as *mut (String, HWND));
-            let (ref needle_session, ref mut target) = *data;
+            let data = &mut *(l.0 as *mut (String, bool, HWND));
+            let (ref required_token, must_have_session, ref mut target) = *data;
             // Skip our own popup.
             let mut class_buf = [0u16; 64];
             let n = GetClassNameW(hwnd, &mut class_buf) as usize;
@@ -546,19 +548,24 @@ unsafe fn activate_herdr_host(session: &str) {
             if title_lc.is_empty() || !title_lc.contains("herdr") {
                 return BOOL(1);
             }
-            if !needle_session.is_empty() && !title_lc.contains(&needle_session.to_lowercase()) {
-                return BOOL(1);
+            if must_have_session {
+                if !title_lc.contains(&required_token.to_lowercase()) {
+                    return BOOL(1);
+                }
+            } else {
+                // Default session: must NOT contain any "--session" flag.
+                if title_lc.contains("--session") {
+                    return BOOL(1);
+                }
             }
             *target = hwnd;
             BOOL(0) // stop enum
         }
     }
-    let mut pair = (needle_session, target);
+    let mut pair = (required_token, must_have_session, target);
     let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
-    target = pair.1;
+    target = pair.2;
     if !target.0.is_null() {
-        // 如果宿主窗口被最小化，先还原（SW_RESTORE 不会改 maximized/normal
-        // 状态，只对 minimized 起作用）。然后再置顶。
         let _ = ShowWindow(target, SW_RESTORE);
         let _ = BringWindowToTop(target);
         let _ = SetForegroundWindow(target);
