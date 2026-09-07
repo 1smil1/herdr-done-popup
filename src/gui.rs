@@ -488,20 +488,78 @@ unsafe fn paint_popup(hwnd: HWND) {
 /* =============================== click =============================== */
 
 unsafe fn open_target(hwnd: HWND) {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PopupState;
-    if !ptr.is_null() {
+    let (session, pane) = {
+        let ptr = GetWindowLongPtrW(hwnd as _, GWLP_USERDATA) as *mut PopupState;
+        if ptr.is_null() {
+            let _ = DestroyWindow(hwnd);
+            return;
+        }
         let info = &(*ptr).info;
-        // pane focus 才会真的把 herdr host 窗口拉到前台 + 切到对应 pane。
-        // agent focus 只是逻辑上"标记已看到"，不会动窗口。
-        let pane = info.pane.clone();
-        let session = info.session.clone();
-        // 释放 GWLP_USERDATA 之前先读出 session/pane，避免冲突。
-        // herdr --session X pane focus <pane_id> 同步等待完成。
-        let _ = std::process::Command::new("herdr")
-            .args(["--session", &session, "pane", "focus", &pane])
-            .status();
-    }
+        (info.session.clone(), info.pane.clone())
+    };
+
+    // 1. Mark the agent as focused inside herdr. `agent focus` only updates
+    //    herdr's internal state; it does not move any host window.
+    let _ = std::process::Command::new("herdr")
+        .args(["--session", &session, "agent", "focus", &pane])
+        .status();
+
+    // 2. Find the host window (warp / Windows Terminal running this herdr
+    //    session) and bring it to the foreground without changing its
+    //    minimized/maximized state. The herdr client sets the terminal
+    //    title to "herdr-..." (Warp) or the tab name; for named sessions
+    //    the warp title additionally contains "--session <name>".
+    activate_herdr_host(&session);
+
     let _ = DestroyWindow(hwnd);
+}
+
+/// Bring the herdr host window to the foreground for the given session.
+/// Preserves the window's existing state (no SW_RESTORE).
+unsafe fn activate_herdr_host(session: &str) {
+    let needle_session = if session == "default" {
+        // Default herdr has no "--session" flag in the title, so just look
+        // for any visible window whose title starts with "herdr".
+        String::new()
+    } else {
+        format!("--session {}", session)
+    };
+    let mut target: HWND = HWND(std::ptr::null_mut());
+    extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
+        unsafe {
+            let data = &mut *(l.0 as *mut (String, HWND));
+            let (ref needle_session, ref mut target) = *data;
+            // Skip our own popup.
+            let mut class_buf = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut class_buf) as usize;
+            let class = String::from_utf16_lossy(&class_buf[..n]);
+            if class == "HerdrDonePopup" {
+                return BOOL(1);
+            }
+            if !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let mut title_buf = [0u16; 512];
+            let m = GetWindowTextW(hwnd, &mut title_buf) as usize;
+            let title = String::from_utf16_lossy(&title_buf[..m]);
+            let title_lc = title.to_lowercase();
+            if title_lc.is_empty() || !title_lc.contains("herdr") {
+                return BOOL(1);
+            }
+            if !needle_session.is_empty() && !title_lc.contains(&needle_session.to_lowercase()) {
+                return BOOL(1);
+            }
+            *target = hwnd;
+            BOOL(0) // stop enum
+        }
+    }
+    let mut pair = (needle_session, target);
+    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
+    target = pair.1;
+    if !target.0.is_null() {
+        let _ = BringWindowToTop(target);
+        let _ = SetForegroundWindow(target);
+    }
 }
 
 /* =============================== helpers =============================== */
