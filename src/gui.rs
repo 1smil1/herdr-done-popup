@@ -39,7 +39,13 @@ const ROUND: i32 = 20;
 const CLOSE_W: i32 = 42;
 const AUTO_DISMISS_MS: u32 = 10000;
 const FOLLOW_POLL_MS: u32 = 500;
-const RECENT_INPUT_MS: u32 = 5000;
+// Suppress only when the user has been actively typing within this window
+// in the event-source herdr. Keep it short so a long agent run that
+// finishes while the user is reading the screen still pops up.
+const ACTIVE_INPUT_MS: u32 = 2000;
+// After a Permanent popup goes up, dismiss it as soon as the user starts
+// typing anywhere — they saw it.
+const DISMISS_ON_INPUT_MS: u32 = 1500;
 const ID_TIMER_DISMISS: usize = 1;
 const ID_TIMER_FOLLOW: usize = 2;
 const CLASS_NAME: &str = "HerdrDonePopup";
@@ -72,7 +78,6 @@ pub struct PopupInfo {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Decision {
     Suppress,
-    Auto10s,
     Permanent,
 }
 
@@ -94,7 +99,6 @@ pub fn run_popup(info: PopupInfo) {
         ));
         match decision {
             Decision::Suppress => return,
-            Decision::Auto10s => create_popup(info, true),
             Decision::Permanent => create_popup(info, false),
         }
     }
@@ -117,25 +121,24 @@ unsafe fn decide_mode(info: &PopupInfo) -> Decision {
     //                 activity, since typing forces a window to foreground).
     let cursor_session = parse_session_from_title(&cursor_window_title_lc());
     let fg_session = parsed_session.as_deref();
-    let recent = last_input_recent();
+    let input_age_ms = last_input_age_ms();
+    let active = input_age_ms < ACTIVE_INPUT_MS;
     log(&format!(
-        "  inputs: fg_herdr={} fg_title={:?} fg_session={:?} cursor_session={:?} event_session={} recent={}",
-        fg_herdr, title, fg_session, cursor_session, info.session, recent
+        "  inputs: fg_herdr={} fg_title={:?} fg_session={:?} cursor_session={:?} event_session={} input_age_ms={} active={}",
+        fg_herdr, title, fg_session, cursor_session, info.session, input_age_ms, active
     ));
 
-    // Suppress only when we are SURE the user is in the event-source herdr
-    // AND has been actively typing there recently (last ~5s). Two stacked
-    // herdr windows => cursor_session / fg_session reflect the visible one,
-    // and a completion in the hidden one will not match, so the popup shows.
+    // Suppress ONLY when we are SURE the user is in the event-source herdr
+    // AND is actively typing right now (last 2s). Otherwise the popup shows,
+    // so a long agent run that finishes while the user is reading the
+    // screen still notifies.
     let user_in_event_session = cursor_session.as_deref()
         == Some(info.session.to_lowercase().as_str())
         || fg_session == Some(info.session.to_lowercase().as_str());
-    if user_in_event_session && recent {
+    if user_in_event_session && active {
         Decision::Suppress
-    } else if user_in_event_session {
-        // In the same herdr but idle: short nudge so it doesn't pile up.
-        Decision::Auto10s
     } else {
+        // Permanent; auto-dismiss as soon as the user starts typing anywhere.
         Decision::Permanent
     }
 }
@@ -248,16 +251,16 @@ unsafe fn current_pane_id() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-unsafe fn last_input_recent() -> bool {
+unsafe fn last_input_age_ms() -> u32 {
     let mut info = LASTINPUTINFO {
         cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
         dwTime: 0,
     };
     if !GetLastInputInfo(&mut info).as_bool() {
-        return false;
+        return u32::MAX;
     }
     let now = GetTickCount();
-    now.wrapping_sub(info.dwTime) < RECENT_INPUT_MS
+    now.wrapping_sub(info.dwTime)
 }
 
 unsafe fn user_moved_into_tab(info: &PopupInfo) -> bool {
@@ -416,7 +419,9 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                         let _ = DestroyWindow(hwnd);
                         return LRESULT(0);
                     }
-                    if !state.auto_dismiss && last_input_recent() {
+                    // Permanent popup: dismiss as soon as the user starts
+                    // typing — they've seen it.
+                    if !state.auto_dismiss && last_input_age_ms() < DISMISS_ON_INPUT_MS {
                         state.auto_dismiss = true;
                         let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
                         log("follow: user active -> start 10s dismiss");
