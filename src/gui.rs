@@ -43,7 +43,9 @@ const ID_TIMER_FOLLOW: usize = 2;
 const CLASS_NAME: &str = "HerdrDonePopup";
 const CONTROLLER_CLASS: &str = "HerdrDonePopupCtrl";
 
+#[allow(dead_code)]
 const ID_OPEN: usize = 1001;
+#[allow(dead_code)]
 const ID_IGNORE: usize = 1002;
 
 #[derive(Clone, Debug, Default)]
@@ -107,22 +109,21 @@ unsafe fn decide_mode(info: &PopupInfo) -> Decision {
         None
     };
     let same_session = parsed_session.as_deref() == Some(info.session.to_lowercase().as_str());
-    let workspace_id = info.pane.split(':').next().unwrap_or("").to_string();
-    let focused_tab = if same_session {
-        focused_tab_in(&info.session, &workspace_id)
+    // Use the foreground herdr's CURRENT pane (whatever its UI is focused on).
+    // When two herdr windows are stacked, fg_pane belongs to the top one —
+    // so a completion in the hidden session never matches and the popup shows.
+    let fg_pane = if fg_herdr && same_session && !info.pane.is_empty() {
+        current_pane_id()
     } else {
         None
     };
+    let viewing_event_pane = fg_pane.as_deref() == Some(info.pane.as_str());
     let recent = last_input_recent();
     log(&format!(
-        "  inputs: fg_herdr={} fg_title={:?} parsed_session={:?} same_session={} focused_tab={:?} recent={}",
-        fg_herdr, title, parsed_session, same_session, focused_tab, recent
+        "  inputs: fg_herdr={} fg_title={:?} parsed_session={:?} same_session={} fg_pane={:?} event_pane={} recent={}",
+        fg_herdr, title, parsed_session, same_session, fg_pane, info.pane, recent
     ));
-    if fg_herdr
-        && same_session
-        && !info.tab_id.is_empty()
-        && focused_tab.as_deref() == Some(info.tab_id.as_str())
-    {
+    if viewing_event_pane {
         Decision::Suppress
     } else if recent {
         Decision::Auto10s
@@ -164,6 +165,7 @@ fn parse_session_from_title(title_lc: &str) -> Option<String> {
     Some("default".to_string())
 }
 
+#[allow(dead_code)]
 unsafe fn focused_tab_in(session: &str, workspace_id: &str) -> Option<String> {
     let out = Command::new("herdr")
         .args([
@@ -175,6 +177,7 @@ unsafe fn focused_tab_in(session: &str, workspace_id: &str) -> Option<String> {
     find_focused_tab_id(&v)
 }
 
+#[allow(dead_code)]
 fn find_focused_tab_id(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::Object(map) => {
@@ -202,6 +205,21 @@ fn find_focused_tab_id(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Returns the pane_id that the foreground herdr UI is currently focused on.
+/// Uses `pane current --current` (no --session), which talks to whichever
+/// session holds the focused pane. Returns None on any failure so callers
+/// fall back to "show popup".
+unsafe fn current_pane_id() -> Option<String> {
+    let out = Command::new("herdr")
+        .args(["pane", "current", "--current"])
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
+    v.pointer("/result/pane/pane_id")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
 unsafe fn last_input_recent() -> bool {
     let mut info = LASTINPUTINFO {
         cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
@@ -225,17 +243,12 @@ unsafe fn user_moved_into_tab(info: &PopupInfo) -> bool {
     if parsed != info.session.to_lowercase() {
         return false;
     }
-    if info.tab_id.is_empty() {
+    if info.pane.is_empty() {
         return false;
     }
-    let workspace_id = info.pane.split(':').next().unwrap_or("");
-    if workspace_id.is_empty() {
-        return false;
-    }
-    match focused_tab_in(&info.session, workspace_id) {
-        Some(focused) => focused == info.tab_id,
-        None => false,
-    }
+    // The popup should dismiss the moment the user's UI focus enters the
+    // originating pane — regardless of which tab it's in.
+    current_pane_id().as_deref() == Some(info.pane.as_str())
 }
 
 /* =============================== popup window =============================== */
