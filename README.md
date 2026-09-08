@@ -32,18 +32,19 @@ the right edge.
 ## When does the popup show / stay / go away?
 
 The popup event fires on every `pane.agent_status_changed` for your Herdr
-sessions. We **suppress** it only if all of these are true:
+sessions. We **suppress** it only when ALL of these are true:
 
-- The foreground window is a Herdr window
-- It belongs to the same Herdr session as the completion
-- The user's focused tab in that session is the same tab as the completion
+- The mouse cursor is over a Herdr window (or the foreground window is a
+  Herdr window) — i.e. you're looking at Herdr right now
+- That Herdr belongs to the same session as the completion
+- You've been actively typing in the last 2 seconds
 
-Anything else (different Herdr / different session / different workspace /
-different tab) → the popup shows.
+Anything else → the popup shows and stays until dismissed.
 
-If the popup is up and you start typing anywhere, it auto-dismisses in 10s.
-If you switch focus into the originating tab, it dismisses immediately. If you
-just leave it alone, it stays until you click × or focus the originating tab.
+If the popup is up and you start typing anywhere, it dismisses itself in
+~1.5s (you've seen it). If you switch focus into the originating pane,
+it dismisses immediately via the follow timer. If you leave it alone,
+it stays.
 
 ## Install
 

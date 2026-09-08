@@ -1,6 +1,6 @@
 id = "herdr-done-popup"
 name = "Herdr Done Popup"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.8.0"
 description = "Persistent desktop popup when an AI agent in any Herdr pane completes a task or asks a question."
 platforms = ["macos", "linux", "windows"]
