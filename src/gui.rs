@@ -114,28 +114,49 @@ unsafe fn decide_mode(info: &PopupInfo) -> Decision {
     } else {
         None
     };
-    // Where is the user's attention? Two signals:
+    // Where is the user's attention? Three signals:
     //   * cursor_session: top-level herdr window the mouse cursor is hovering.
-    //                    This is the most reliable "what is the user looking at".
+    //                    Most reliable "what is the user looking at".
     //   * fg_session: z-order foreground herdr's session (= last keyboard
     //                 activity, since typing forces a window to foreground).
+    //   * fg_workspace: workspace_id of the foreground herdr's focused pane.
+    //                  Needed because the user can be in the same herdr
+    //                  session but a different workspace/tab than the event.
     let cursor_session = parse_session_from_title(&cursor_window_title_lc());
     let fg_session = parsed_session.as_deref();
+    let fg_workspace = if fg_herdr {
+        current_focus_workspace_id()
+    } else {
+        None
+    };
+    let event_workspace = info
+        .pane
+        .split(':')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     let input_age_ms = last_input_age_ms();
     let active = input_age_ms < ACTIVE_INPUT_MS;
     log(&format!(
-        "  inputs: fg_herdr={} fg_title={:?} fg_session={:?} cursor_session={:?} event_session={} input_age_ms={} active={}",
-        fg_herdr, title, fg_session, cursor_session, info.session, input_age_ms, active
+        "  inputs: fg_herdr={} fg_title={:?} fg_session={:?} cursor_session={:?} fg_workspace={:?} event_session={} event_workspace={:?} input_age_ms={} active={}",
+        fg_herdr, title, fg_session, cursor_session, fg_workspace, info.session, event_workspace, input_age_ms, active
     ));
 
-    // Suppress ONLY when we are SURE the user is in the event-source herdr
-    // AND is actively typing right now (last 2s). Otherwise the popup shows,
-    // so a long agent run that finishes while the user is reading the
-    // screen still notifies.
+    // Suppress ONLY when ALL of these hold:
+    //   - user is in the event-source session (cursor OR fg session matches)
+    //   - user's focused workspace matches the event's workspace
+    //   - user is actively typing right now (last 2s)
+    // Otherwise the popup shows, so e.g. finishing in workspace wY while the
+    // user is working in workspace wX of the same session still notifies.
     let user_in_event_session = cursor_session.as_deref()
         == Some(info.session.to_lowercase().as_str())
         || fg_session == Some(info.session.to_lowercase().as_str());
-    if user_in_event_session && active {
+    let workspace_matches = match (&fg_workspace, &event_workspace) {
+        (Some(f), Some(e)) => f == e,
+        // Can't determine -> don't suppress just on this axis.
+        _ => true,
+    };
+    if user_in_event_session && workspace_matches && active {
         Decision::Suppress
     } else {
         // Permanent; auto-dismiss as soon as the user starts typing anywhere.
@@ -247,6 +268,20 @@ unsafe fn current_pane_id() -> Option<String> {
         .ok()?;
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
     v.pointer("/result/pane/pane_id")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+/// workspace_id of the foreground herdr's currently focused pane (e.g.
+/// "wX"). Used to detect "user is in the same session but a DIFFERENT
+/// workspace than the event". Returns None on any failure.
+unsafe fn current_focus_workspace_id() -> Option<String> {
+    let out = Command::new("herdr")
+        .args(["pane", "current", "--current"])
+        .output()
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
+    v.pointer("/result/pane/workspace_id")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
 }
