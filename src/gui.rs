@@ -19,11 +19,13 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumWindows, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
+    EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetWindowLongPtrW, GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW, MSG, PeekMessageW,
+    WindowFromPoint,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, PM_REMOVE, SW_RESTORE,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ERASEBKGND,
+    GA_ROOT,
     WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WNDPROC,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
@@ -108,28 +110,54 @@ unsafe fn decide_mode(info: &PopupInfo) -> Decision {
     } else {
         None
     };
-    let same_session = parsed_session.as_deref() == Some(info.session.to_lowercase().as_str());
-    // Use the foreground herdr's CURRENT pane (whatever its UI is focused on).
-    // When two herdr windows are stacked, fg_pane belongs to the top one —
-    // so a completion in the hidden session never matches and the popup shows.
-    let fg_pane = if fg_herdr && same_session && !info.pane.is_empty() {
-        current_pane_id()
-    } else {
-        None
-    };
-    let viewing_event_pane = fg_pane.as_deref() == Some(info.pane.as_str());
+    // Where is the user's attention? Two signals:
+    //   * cursor_session: top-level herdr window the mouse cursor is hovering.
+    //                    This is the most reliable "what is the user looking at".
+    //   * fg_session: z-order foreground herdr's session (= last keyboard
+    //                 activity, since typing forces a window to foreground).
+    let cursor_session = parse_session_from_title(&cursor_window_title_lc());
+    let fg_session = parsed_session.as_deref();
     let recent = last_input_recent();
     log(&format!(
-        "  inputs: fg_herdr={} fg_title={:?} parsed_session={:?} same_session={} fg_pane={:?} event_pane={} recent={}",
-        fg_herdr, title, parsed_session, same_session, fg_pane, info.pane, recent
+        "  inputs: fg_herdr={} fg_title={:?} fg_session={:?} cursor_session={:?} event_session={} recent={}",
+        fg_herdr, title, fg_session, cursor_session, info.session, recent
     ));
-    if viewing_event_pane {
+
+    // Suppress only when we are SURE the user is in the event-source herdr
+    // AND has been actively typing there recently (last ~5s). Two stacked
+    // herdr windows => cursor_session / fg_session reflect the visible one,
+    // and a completion in the hidden one will not match, so the popup shows.
+    let user_in_event_session = cursor_session.as_deref()
+        == Some(info.session.to_lowercase().as_str())
+        || fg_session == Some(info.session.to_lowercase().as_str());
+    if user_in_event_session && recent {
         Decision::Suppress
-    } else if recent {
+    } else if user_in_event_session {
+        // In the same herdr but idle: short nudge so it doesn't pile up.
         Decision::Auto10s
     } else {
         Decision::Permanent
     }
+}
+
+/// Title of the top-level herdr-style window under the mouse cursor, lowercased.
+/// Returns "" if the cursor isn't over a herdr-style window or we can't tell.
+unsafe fn cursor_window_title_lc() -> String {
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return String::new();
+    }
+    let hit = WindowFromPoint(pt);
+    if hit.0.is_null() {
+        return String::new();
+    }
+    // Walk up to the top-level (so child panes of a terminal all collapse to
+    // the same herdr window).
+    let top = GetAncestor(hit, GA_ROOT);
+    let h = if top.0.is_null() { hit } else { top };
+    let mut buf = [0u16; 512];
+    let n = GetWindowTextW(h, &mut buf) as usize;
+    String::from_utf16_lossy(&buf[..n]).to_string()
 }
 
 unsafe fn foreground_is_herdr() -> bool {
