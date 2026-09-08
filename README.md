@@ -37,6 +37,9 @@ sessions. We **suppress** it only when ALL of these are true:
 - The mouse cursor is over a Herdr window (or the foreground window is a
   Herdr window) — i.e. you're looking at Herdr right now
 - That Herdr belongs to the same session as the completion
+- The Herdr's currently focused workspace is the same workspace as the
+  completion (so you can be in the same session but in a different
+  workspace and still get the popup)
 - You've been actively typing in the last 2 seconds
 
 Anything else → the popup shows and stays until dismissed.
