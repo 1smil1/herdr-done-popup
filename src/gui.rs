@@ -43,9 +43,6 @@ const FOLLOW_POLL_MS: u32 = 500;
 // in the event-source herdr. Keep it short so a long agent run that
 // finishes while the user is reading the screen still pops up.
 const ACTIVE_INPUT_MS: u32 = 2000;
-// After a Permanent popup goes up, dismiss it as soon as the user starts
-// typing anywhere — they saw it.
-const DISMISS_ON_INPUT_MS: u32 = 1500;
 const ID_TIMER_DISMISS: usize = 1;
 const ID_TIMER_FOLLOW: usize = 2;
 const CLASS_NAME: &str = "HerdrDonePopup";
@@ -83,7 +80,6 @@ enum Decision {
 
 struct PopupState {
     info: PopupInfo,
-    auto_dismiss: bool,
 }
 
 /// Public entry: build the popup, run its message loop, return when destroyed.
@@ -99,7 +95,7 @@ pub fn run_popup(info: PopupInfo) {
         ));
         match decision {
             Decision::Suppress => return,
-            Decision::Permanent => create_popup(info, false),
+            Decision::Permanent => create_popup(info),
         }
     }
 }
@@ -331,7 +327,7 @@ unsafe fn user_moved_into_tab(info: &PopupInfo) -> bool {
 
 /* =============================== popup window =============================== */
 
-unsafe fn create_popup(info: PopupInfo, auto_dismiss: bool) {
+unsafe fn create_popup(info: PopupInfo) {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -348,7 +344,7 @@ unsafe fn create_popup(info: PopupInfo, auto_dismiss: bool) {
     let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot as i32;
 
     let class = wide(CLASS_NAME);
-    let state = Box::new(PopupState { info, auto_dismiss });
+    let state = Box::new(PopupState { info });
     let ptr = Box::into_raw(state);
     let hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -382,9 +378,11 @@ unsafe fn create_popup(info: PopupInfo, auto_dismiss: bool) {
     );
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
-    if auto_dismiss {
-        let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
-    }
+    // Every popup gets a hard 10s lifetime — even Permanent ones — so it
+    // can't pile up while the user is busy elsewhere. The follow timer
+    // upgrades nothing to 10s anymore (already set above); it only checks
+    // whether the user dismissed by switching into the originating pane.
+    let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
     let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
 
     // Run a message loop until the window is destroyed.
@@ -455,38 +453,18 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
             }
             match id {
                 ID_TIMER_DISMISS => {
-                    if (*ptr).auto_dismiss {
-                        let _ = DestroyWindow(hwnd);
-                    }
+                    // Every popup has a hard 10s lifetime, set in create_popup.
+                    let _ = DestroyWindow(hwnd);
                 }
                 ID_TIMER_FOLLOW => {
                     let state = &mut *ptr;
+                    // Dismiss the moment the user's UI focus enters the
+                    // originating pane — they can see the popup's content
+                    // directly in the pane now.
                     if user_moved_into_tab(&state.info) {
                         log("follow: user entered tab -> dismiss");
                         let _ = DestroyWindow(hwnd);
                         return LRESULT(0);
-                    }
-                    // Permanent popup: dismiss as soon as the user starts
-                    // typing — but ONLY if their keyboard focus is on a
-                    // window belonging to the event-source herdr. Without
-                    // this guard, clicking into Chrome (which counts as
-                    // input for GetLastInputInfo) silently kills the popup
-                    // before the user has a chance to see it.
-                    let ev = state.info.session.to_lowercase();
-                    let fg_in_event = foreground_is_herdr()
-                        && parse_session_from_title(&foreground_title().to_lowercase())
-                            .as_deref()
-                            == Some(ev.as_str());
-                    let cursor_in_event = parse_session_from_title(&cursor_window_title_lc())
-                        .as_deref()
-                        == Some(ev.as_str());
-                    if !state.auto_dismiss
-                        && (fg_in_event || cursor_in_event)
-                        && last_input_age_ms() < DISMISS_ON_INPUT_MS
-                    {
-                        state.auto_dismiss = true;
-                        let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
-                        log("follow: user active in event herdr -> start 10s dismiss");
                     }
                 }
                 _ => {}
