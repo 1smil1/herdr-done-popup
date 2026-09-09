@@ -272,21 +272,30 @@ unsafe fn current_pane_id() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// workspace_id of the foreground herdr's currently focused pane (e.g.
-/// "wX"). Must be queried with `herdr --session <session>` so the result
-/// actually belongs to the foreground window's session — without
-/// `--session`, the CLI talks to whichever session the calling shell is
-/// in (which may be the event-source session, not the foreground window's).
-/// Returns None on any failure.
+/// workspace_id of the foreground herdr's currently focused workspace
+/// (e.g. "wX"). Reads `herdr --session <session> workspace list` and
+/// picks the workspace whose `focused == true`.
+///
+/// `pane current --current` is unreliable for this because it returns the
+/// pane that owns the calling shell, which is the event-source pane, not
+/// the UI-focused pane. `workspace list` reports the UI focus state.
 unsafe fn current_focus_workspace_id(session: &str) -> Option<String> {
     let out = Command::new("herdr")
-        .args(["--session", session, "pane", "current", "--current"])
+        .args(["--session", session, "workspace", "list"])
         .output()
         .ok()?;
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
-    v.pointer("/result/pane/workspace_id")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+    let arr = v.pointer("/result/workspaces")?.as_array()?;
+    for w in arr {
+        let focused = w.get("focused").and_then(|f| f.as_bool()).unwrap_or(false);
+        if focused {
+            return w
+                .get("workspace_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 unsafe fn last_input_age_ms() -> u32 {
