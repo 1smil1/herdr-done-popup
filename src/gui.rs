@@ -124,8 +124,8 @@ unsafe fn decide_mode(info: &PopupInfo) -> Decision {
     //                  session but a different workspace/tab than the event.
     let cursor_session = parse_session_from_title(&cursor_window_title_lc());
     let fg_session = parsed_session.as_deref();
-    let fg_workspace = if fg_herdr {
-        current_focus_workspace_id()
+    let fg_workspace = if let Some(s) = fg_session {
+        current_focus_workspace_id(s)
     } else {
         None
     };
@@ -273,11 +273,14 @@ unsafe fn current_pane_id() -> Option<String> {
 }
 
 /// workspace_id of the foreground herdr's currently focused pane (e.g.
-/// "wX"). Used to detect "user is in the same session but a DIFFERENT
-/// workspace than the event". Returns None on any failure.
-unsafe fn current_focus_workspace_id() -> Option<String> {
+/// "wX"). Must be queried with `herdr --session <session>` so the result
+/// actually belongs to the foreground window's session — without
+/// `--session`, the CLI talks to whichever session the calling shell is
+/// in (which may be the event-source session, not the foreground window's).
+/// Returns None on any failure.
+unsafe fn current_focus_workspace_id(session: &str) -> Option<String> {
     let out = Command::new("herdr")
-        .args(["pane", "current", "--current"])
+        .args(["--session", session, "pane", "current", "--current"])
         .output()
         .ok()?;
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
