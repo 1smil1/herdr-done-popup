@@ -467,11 +467,26 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                         return LRESULT(0);
                     }
                     // Permanent popup: dismiss as soon as the user starts
-                    // typing — they've seen it.
-                    if !state.auto_dismiss && last_input_age_ms() < DISMISS_ON_INPUT_MS {
+                    // typing — but ONLY if their keyboard focus is on a
+                    // window belonging to the event-source herdr. Without
+                    // this guard, clicking into Chrome (which counts as
+                    // input for GetLastInputInfo) silently kills the popup
+                    // before the user has a chance to see it.
+                    let ev = state.info.session.to_lowercase();
+                    let fg_in_event = foreground_is_herdr()
+                        && parse_session_from_title(&foreground_title().to_lowercase())
+                            .as_deref()
+                            == Some(ev.as_str());
+                    let cursor_in_event = parse_session_from_title(&cursor_window_title_lc())
+                        .as_deref()
+                        == Some(ev.as_str());
+                    if !state.auto_dismiss
+                        && (fg_in_event || cursor_in_event)
+                        && last_input_age_ms() < DISMISS_ON_INPUT_MS
+                    {
                         state.auto_dismiss = true;
                         let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
-                        log("follow: user active -> start 10s dismiss");
+                        log("follow: user active in event herdr -> start 10s dismiss");
                     }
                 }
                 _ => {}
