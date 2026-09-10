@@ -10,9 +10,10 @@ use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, SetBkMode, SetTextColor, SetWindowRgn, HGDIOBJ, MONITORINFO,
-    MonitorFromPoint, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK, PAINTSTRUCT, TRANSPARENT,
+    FillRect, HMONITOR, HGDIOBJ, MONITORINFO,
+    MonitorFromPoint, MonitorFromWindow, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
+    SetBkMode, SetTextColor, SetWindowRgn,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetTickCount;
@@ -20,8 +21,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINF
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW, MSG, PeekMessageW,
-    WindowFromPoint,
+    GetWindowLongPtrW, GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW,
+    MSG, PeekMessageW, WindowFromPoint,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, PM_REMOVE, SW_RESTORE,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ERASEBKGND,
@@ -328,9 +329,16 @@ unsafe fn user_moved_into_tab(info: &PopupInfo) -> bool {
 /* =============================== popup window =============================== */
 
 unsafe fn create_popup(info: PopupInfo) {
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    // Pick the monitor by walking up from the EVENT-source herdr window.
+    // Otherwise a popup for an agent in dse can land on DISPLAY1 while the
+    // user is reading Chrome on DISPLAY2 -- invisible until it expires.
+    let monitor = event_source_monitor(&info.session)
+        .unwrap_or_else(|| {
+            // Fall back to cursor monitor if we cannot locate the event herdr.
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+        });
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -419,6 +427,44 @@ unsafe fn count_visible_popups() -> u32 {
     }
     let _ = EnumWindows(Some(enum_proc), LPARAM(&mut count as *mut _ as isize));
     count
+}
+
+/// Pick a monitor by finding a top-level herdr window whose title
+/// indicates it belongs to the given session, then returning the monitor
+/// that window lives on. We do this so a popup for an agent in dse lands
+/// on the same screen the user actually has dse open on, even if the
+/// cursor is currently on another monitor (e.g. reading Chrome on
+/// DISPLAY2 while dse is on DISPLAY1).
+unsafe fn event_source_monitor(session: &str) -> Option<HMONITOR> {
+    let session_lower = session.to_lowercase();
+    let mut found: Option<HWND> = None;
+    extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
+        unsafe {
+            let (target, sess) = &mut *(l.0 as *mut (&mut Option<HWND>, String));
+            let mut buf = [0u16; 512];
+            let n = GetWindowTextW(hwnd, &mut buf) as usize;
+            if n == 0 {
+                return BOOL(1);
+            }
+            let title = String::from_utf16_lossy(&buf[..n]).to_lowercase();
+            if !title.contains("herdr") {
+                return BOOL(1);
+            }
+            let matches = if sess == "default" {
+                !title.contains("--session")
+            } else {
+                title.contains(&format!("--session {}", sess))
+            };
+            if matches && IsWindowVisible(hwnd).as_bool() {
+                *(*target) = Some(hwnd);
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+    }
+    let mut pair: (&mut Option<HWND>, String) = (&mut found, session_lower);
+    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
+    found.map(|h| MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST))
 }
 
 /* =============================== window proc =============================== */
