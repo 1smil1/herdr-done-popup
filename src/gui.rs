@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetWindowLongPtrW, GetWindowTextW, IsIconic, IsWindowVisible, LoadCursorW,
     MSG, PeekMessageW, WindowFromPoint,
-    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    RegisterClassW, SetForegroundWindow, SetTimer, KillTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, PM_REMOVE, SW_RESTORE,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_ERASEBKGND,
     GA_ROOT,
@@ -38,7 +38,18 @@ const MARGIN: i32 = 20;
 const GAP: i32 = 8;
 const ROUND: i32 = 20;
 const CLOSE_W: i32 = 42;
-const AUTO_DISMISS_MS: u32 = 10000;
+// Ultimate safety-net hard lifetime: even an inactive user gets the popup
+// cleaned up eventually (e.g. if the system goes to sleep and the input
+// timers never tick). 30 minutes is long enough that a user reading/watching
+// video or simply AFK won't notice it; short enough to bound resource use.
+const AUTO_DISMISS_MS: u32 = 30 * 60 * 1000;
+// After the user has been detected active (any input in the last
+// ACTIVE_INPUT_MS), downgrade the dismiss timer to this so the popup
+// leaves quickly once the user is around.
+const ACTIVE_DISMISS_MS: u32 = 10000;
+// And if the user is typing right inside the originating pane, dismiss
+// even faster — they can already see the answer inline.
+const FAST_DISMISS_MS: u32 = 1000;
 const FOLLOW_POLL_MS: u32 = 500;
 // Suppress only when the user has been actively typing within this window
 // in the event-source herdr. Keep it short so a long agent run that
@@ -81,6 +92,13 @@ enum Decision {
 
 struct PopupState {
     info: PopupInfo,
+    /// True once we've observed user activity and downgraded the dismiss
+    /// timer to ACTIVE_DISMISS_MS. Prevents flapping between active/inactive
+    /// dismissal timelines.
+    downgraded: bool,
+    /// True once the user has been observed typing inside the originating
+    /// pane; downgrade further to FAST_DISMISS_MS.
+    fast_path: bool,
 }
 
 /// Public entry: build the popup, run its message loop, return when destroyed.
@@ -377,7 +395,11 @@ unsafe fn create_popup(info: PopupInfo) {
     let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot as i32;
 
     let class = wide(CLASS_NAME);
-    let state = Box::new(PopupState { info });
+    let state = Box::new(PopupState {
+        info,
+        downgraded: false,
+        fast_path: false,
+    });
     let ptr = Box::into_raw(state);
     let hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -411,10 +433,11 @@ unsafe fn create_popup(info: PopupInfo) {
     );
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
-    // Every popup gets a hard 10s lifetime — even Permanent ones — so it
-    // can't pile up while the user is busy elsewhere. The follow timer
-    // upgrades nothing to 10s anymore (already set above); it only checks
-    // whether the user dismissed by switching into the originating pane.
+    // Default hard lifetime is AUTO_DISMISS_MS (30 minutes) so a popup shown
+    // while the user is AFK (watching video, asleep, on the phone) stays
+    // visible until they come back. The follow timer downgrades this to
+    // ACTIVE_DISMISS_MS once it detects any user input, and further to
+    // FAST_DISMISS_MS if the user is typing inside the originating pane.
     let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
     let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
 
@@ -529,12 +552,28 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM)
                 }
                 ID_TIMER_FOLLOW => {
                     let state = &mut *ptr;
-                    // Dismiss the moment the user's UI focus enters the
-                    // originating pane — they can see the popup's content
-                    // directly in the pane now.
-                    if user_moved_into_tab(&state.info) {
-                        log("follow: user entered tab -> dismiss");
-                        let _ = DestroyWindow(hwnd);
+                    // Fast path: user is typing inside the originating
+                    // pane — they can see the answer inline, dismiss
+                    // quickly. Sticky so we don't re-downgrade.
+                    if !state.fast_path && user_moved_into_tab(&state.info) {
+                        let active = last_input_age_ms() < ACTIVE_INPUT_MS;
+                        if active {
+                            log("follow: typing in event pane -> fast dismiss");
+                            state.fast_path = true;
+                            // Re-arm the dismiss timer at the fast rate.
+                            let _ = KillTimer(Some(hwnd), ID_TIMER_DISMISS);
+                            let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, FAST_DISMISS_MS, None);
+                            return LRESULT(0);
+                        }
+                    }
+                    // Active path: user has been doing *something* recently
+                    // (any input — even mouse jiggle on a different
+                    // monitor). Downgrade the dismiss timer once.
+                    if !state.downgraded && last_input_age_ms() < ACTIVE_INPUT_MS {
+                        log("follow: user active -> 10s dismiss");
+                        state.downgraded = true;
+                        let _ = KillTimer(Some(hwnd), ID_TIMER_DISMISS);
+                        let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, ACTIVE_DISMISS_MS, None);
                         return LRESULT(0);
                     }
                 }
