@@ -255,18 +255,41 @@ fn find_focused_tab_id(v: &serde_json::Value) -> Option<String> {
 }
 
 /// Returns the pane_id that the foreground herdr UI is currently focused on.
-/// Uses `pane current --current` (no --session), which talks to whichever
-/// session holds the focused pane. Returns None on any failure so callers
-/// fall back to "show popup".
-unsafe fn current_pane_id() -> Option<String> {
-    let out = Command::new("herdr")
-        .args(["pane", "current", "--current"])
-        .output()
-        .ok()?;
+///
+/// IMPORTANT: must not use bare `pane current --current`. Without `--session`
+/// the herdr CLI returns the pane that owns the calling shell, which is
+/// the EVENT-source pane (the one we're showing the popup for). That
+/// caused the popup to immediately dismiss itself in the same
+/// "session, different workspace" case the user reported: the plugin
+/// process is itself the shell for the event pane, so `pane current
+/// --current` keeps matching `info.pane` on every follow tick.
+///
+/// We instead query `pane list --workspace <event_workspace>` and pick
+/// the pane whose `focused == true`. That's the user's actual UI focus
+/// inside the workspace the completion happened in — and it'll be None
+/// if the user is in a different workspace of the same session, exactly
+/// the case where we want the popup to keep showing.
+unsafe fn current_pane_id(event_workspace: Option<&str>) -> Option<String> {
+    let mut cmd = Command::new("herdr");
+    cmd.arg("pane").arg("list");
+    if let Some(ws) = event_workspace {
+        if !ws.is_empty() {
+            cmd.arg("--workspace").arg(ws);
+        }
+    }
+    let out = cmd.output().ok()?;
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
-    v.pointer("/result/pane/pane_id")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+    let arr = v.pointer("/result/panes")?.as_array()?;
+    for p in arr {
+        let focused = p.get("focused").and_then(|f| f.as_bool()).unwrap_or(false);
+        if focused {
+            return p
+                .get("pane_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 /// workspace_id of the foreground herdr's currently focused workspace
@@ -322,8 +345,10 @@ unsafe fn user_moved_into_tab(info: &PopupInfo) -> bool {
         return false;
     }
     // The popup should dismiss the moment the user's UI focus enters the
-    // originating pane — regardless of which tab it's in.
-    current_pane_id().as_deref() == Some(info.pane.as_str())
+    // originating pane. Scope the lookup to the event's workspace so a
+    // different-workspace focus doesn't accidentally match.
+    let event_ws = info.pane.split(':').next().filter(|s| !s.is_empty());
+    current_pane_id(event_ws).as_deref() == Some(info.pane.as_str())
 }
 
 /* =============================== popup window =============================== */
