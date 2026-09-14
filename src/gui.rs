@@ -14,7 +14,7 @@ use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, HMONITOR, HGDIOBJ, MONITORINFO,
+    EnumDisplayMonitors, FillRect, HDC, HMONITOR, HGDIOBJ, MONITORINFO,
     MonitorFromPoint, MonitorFromWindow, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
     InvalidateRect, SetBkMode, SetTextColor, SetWindowRgn,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, PAINTSTRUCT, TRANSPARENT,
@@ -478,14 +478,15 @@ unsafe fn create_popup_oneshot(info: PopupInfo) {
 }
 
 /// Pick the monitor and (x, y) for a popup anchored to the bottom-right
-/// of that monitor's work area. Daemon-mode coalesces to one popup at a
-/// time, so `slot` should always be 0 -- callers pass 0 anyway.
-unsafe fn compute_popup_position(info: &PopupInfo, slot: i32) -> (i32, i32) {
-    let monitor = event_source_monitor(&info.session).unwrap_or_else(|| {
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
-    });
+/// of the monitor where the cursor currently lives. We use the cursor
+/// instead of trying to locate the event-source herdr window because the
+/// event may come from a different session whose host window is on a
+/// monitor the user is no longer watching. The cursor position always
+/// tracks where the user is looking.
+unsafe fn compute_popup_position(_info: &PopupInfo, slot: i32) -> (i32, i32) {
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -495,10 +496,28 @@ unsafe fn compute_popup_position(info: &PopupInfo, slot: i32) -> (i32, i32) {
     let x = r.right - POPUP_W - MARGIN;
     let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot;
     log(&format!(
-        "popup monitor: work=({},{},{},{}) pos=({},{})",
+        "popup monitor: src=cursor work=({},{},{},{}) pos=({},{})",
         r.left, r.top, r.right, r.bottom, x, y
     ));
     (x, y)
+}
+
+/// Enumerate every connected monitor and yield its HMONITOR.
+/// (kept for possible future per-monitor popup fan-out; unused today)
+#[allow(dead_code)]
+unsafe fn all_monitors() -> Vec<HMONITOR> {
+    let mut out: Vec<HMONITOR> = Vec::new();
+    struct Ctx(*mut Vec<HMONITOR>);
+    extern "system" fn enum_proc(hmonitor: HMONITOR, _: HDC, _: *mut RECT, l: LPARAM) -> BOOL {
+        unsafe {
+            let ctx = &mut *(l.0 as *mut Ctx);
+            (*ctx.0).push(hmonitor);
+            BOOL(1)
+        }
+    }
+    let ctx = Ctx(&mut out as *mut Vec<HMONITOR>);
+    let _ = EnumDisplayMonitors(None, None, Some(enum_proc), LPARAM(&ctx as *const _ as isize));
+    out
 }
 
 /// Create the popup window and return its HWND. Caller is responsible
@@ -671,6 +690,7 @@ unsafe fn count_visible_popups() -> u32 {
 /// and `MonitorFromWindow` on a minimized window returns the monitor the
 /// window *was last on*, which can be wrong if the user moved dse between
 /// monitors or if the window was minimized from a different display.
+#[allow(dead_code)]
 unsafe fn event_source_monitor(session: &str) -> Option<HMONITOR> {
     let session_lower = session.to_lowercase();
     let mut found: Option<HWND> = None;
