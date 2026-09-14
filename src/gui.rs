@@ -563,6 +563,10 @@ unsafe fn position_for_monitor(monitor: HMONITOR, slot: i32) -> Option<(i32, i32
     let r = mi.rcWork;
     let x = r.right - POPUP_W - MARGIN;
     let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot;
+    log(&format!(
+        "popup monitor: src=per-monitor slot={} work=({},{},{},{}) pos=({},{})",
+        slot, r.left, r.top, r.right, r.bottom, x, y
+    ));
     Some((x, y))
 }
 
@@ -647,7 +651,9 @@ unsafe fn create_popup_window(
     ));
     let rgn = CreateRoundRectRgn(0, 0, POPUP_W, POPUP_H, ROUND, ROUND);
     let _ = SetWindowRgn(hwnd, Some(rgn), true);
-    // Force popup on top + grab focus.
+    // Force popup on top + grab focus. Use NOACTIVATE so we don't steal
+    // focus from the user's terminal -- that would hide the popup behind
+    // the terminal on the next focus restore.
     let _ = SetWindowPos(
         hwnd,
         Some(HWND_TOPMOST),
@@ -655,10 +661,12 @@ unsafe fn create_popup_window(
         0,
         0,
         0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
     );
     let _ = BringWindowToTop(hwnd);
-    let _ = SetForegroundWindow(hwnd);
+    // Skip SetForegroundWindow: it steals focus from the terminal, and
+    // when the terminal later regains focus the popup gets pushed behind
+    // it. We want the popup to stay visible on top WITHOUT taking focus.
     hwnd
 }
 
@@ -721,6 +729,7 @@ pub unsafe fn run_popup_message_pump(
     let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
 
     let mut msg = MSG::default();
+    let mut topmost_tick: u32 = 0;
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_QUIT {
@@ -733,6 +742,21 @@ pub unsafe fn run_popup_message_pump(
                 finished.store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
+        }
+        // Periodically re-assert topmost so a maximized Warp/Chrome on
+        // top of us doesn't permanently bury the popup. Cheap (every 1s)
+        // and keeps the popup visible on every monitor we launched it on.
+        topmost_tick = topmost_tick.wrapping_add(1);
+        if topmost_tick % 33 == 0 {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
         }
         // Drain any pending daemon command non-blockingly.
         let recv_result = cmd_rx.lock().ok().map(|mut r| r.try_recv());
