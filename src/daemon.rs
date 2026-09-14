@@ -91,6 +91,7 @@ pub fn log(msg: &str) {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let _ = writeln!(f, "[{ts}] daemon: {msg}");
+            let _ = f.flush();
         }
     }
 }
@@ -321,6 +322,10 @@ pub fn run_daemon() -> i32 {
         loop {
             match rx.recv_timeout(Duration::from_millis(DAEMON_TICK_MS)) {
                 Ok(DaemonMsg::Request(new_info)) => {
+                    log(&format!(
+                        "Request handling: current={}",
+                        if current.is_some() { "Some" } else { "None" }
+                    ));
                     if let Some(h) = current.as_mut() {
                         if h.is_alive() {
                             let same_pane = h
@@ -336,7 +341,9 @@ pub fn run_daemon() -> i32 {
                                 let _ = h.send(PopupCmd::Dismiss);
                                 let _ = h.join_timeout(Duration::from_millis(100));
                                 current = None;
+                                log("daemon: about to launch_all_monitors after dismiss");
                                 current = Some(PopupHandle::launch_all_monitors(new_info));
+                                log("daemon: launch_all_monitors returned");
                             }
                         } else {
                             current = None;

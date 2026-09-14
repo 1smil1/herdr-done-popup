@@ -122,12 +122,16 @@ pub enum PopupCmd {
     Dismiss,
 }
 
-/// Owns a popup window's message-pump thread. The daemon uses this to
-/// issue Update / Dismiss commands and to detect when the thread finishes.
+/// Owns popup window's message-pump thread(s). The daemon uses this to
+/// issue Update / Dismiss commands and to detect when the thread(s)
+/// finish. For single-popup launches, `joins` has one entry; for
+/// per-monitor launches it has one per monitor. We track every thread
+/// so we can join (or detach) them all -- otherwise the untracked ones
+/// keep their handles open and risk leaking resources.
 pub struct PopupHandle {
     info: Arc<Mutex<PopupInfo>>,
     cmd_tx: mpsc::Sender<PopupCmd>,
-    join: Option<thread::JoinHandle<()>>,
+    joins: Vec<Option<thread::JoinHandle<()>>>,
     finished: Arc<AtomicBool>,
 }
 
@@ -148,7 +152,7 @@ impl PopupHandle {
         PopupHandle {
             info,
             cmd_tx,
-            join: Some(join),
+            joins: vec![Some(join)],
             finished,
         }
     }
@@ -172,7 +176,7 @@ impl PopupHandle {
             return PopupHandle {
                 info: Arc::new(Mutex::new(initial)),
                 cmd_tx: mpsc::channel::<PopupCmd>().0,
-                join: None,
+                joins: Vec::new(),
                 finished,
             };
         }
@@ -209,12 +213,12 @@ impl PopupHandle {
                     )
                 })
                 .expect("spawn popup thread");
-            joins.push(join);
+            joins.push(Some(join));
         }
         PopupHandle {
             info,
             cmd_tx,
-            join: joins.into_iter().next(), // primary handle for join
+            joins,
             finished,
         }
     }
@@ -236,13 +240,37 @@ impl PopupHandle {
     }
 
     pub fn join_timeout(&mut self, _timeout: std::time::Duration) {
-        if let Some(j) = self.join.take() {
-            // No portable join-with-timeout on std::thread::JoinHandle.
-            // We approximate by polling is_finished. Since `finished` is
-            // set to true *just before* the thread returns, by the time
-            // we observe it, the thread is essentially done. We still
-            // call .join() to free OS resources, but don't block on it.
-            let _ = j.join();
+        // std::thread::JoinHandle has no join-with-timeout, and even a
+        // tiny unfinished popup thread (e.g. one whose SetWindowPos
+        // topmost loop is mid-iteration) would block the daemon's main
+        // control loop forever if we called .join() directly.
+        //
+        // Strategy: if the shared `finished` flag is set we know all
+        // threads have already (or are about to) return; take each
+        // JoinHandle and call join(), which will return immediately.
+        //
+        // If `finished` is NOT set (one or more threads are stuck),
+        // leak the JoinHandles by calling std::mem::forget. The OS
+        // thread is still alive and will exit on its own once it
+        // processes a future Dismiss or hits a WatchdogFor. The
+        // daemon's main loop is unblocked.
+        let finished = self.finished.load(std::sync::atomic::Ordering::SeqCst);
+        if finished {
+            for slot in self.joins.drain(..) {
+                if let Some(j) = slot {
+                    let _ = j.join();
+                }
+            }
+        } else {
+            // Move the JoinHandles out without joining. They become
+            // detached threads -- Rust will not free their stack until
+            // the thread itself exits. The daemon's daemon.rs main
+            // loop continues immediately.
+            for slot in self.joins.drain(..) {
+                if let Some(j) = slot {
+                    std::mem::forget(j);
+                }
+            }
         }
     }
 }
@@ -1177,6 +1205,7 @@ fn log(msg: &str) {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let _ = writeln!(f, "[{ts}] {msg}");
+            let _ = f.flush();
         }
     }
 }
