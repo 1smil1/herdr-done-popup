@@ -6,13 +6,17 @@
 // the window is destroyed, then returns.
 
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
     FillRect, HMONITOR, HGDIOBJ, MONITORINFO,
     MonitorFromPoint, MonitorFromWindow, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
-    SetBkMode, SetTextColor, SetWindowRgn,
+    InvalidateRect, SetBkMode, SetTextColor, SetWindowRgn,
     DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -72,7 +76,7 @@ pub struct PaneMeta {
     pub pane_label: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PopupInfo {
     pub session: String,
     pub agent: String,
@@ -101,7 +105,79 @@ struct PopupState {
     fast_path: bool,
 }
 
-/// Public entry: build the popup, run its message loop, return when destroyed.
+/// Commands sent from the daemon to a popup message-pump thread.
+#[derive(Debug)]
+pub enum PopupCmd {
+    /// Replace the popup's content with new info. Used when a fresh
+    /// event arrives for the same pane -- we update in place instead
+    /// of stacking a new window.
+    Update(PopupInfo),
+    /// Tear down the popup window. Used when a different pane's event
+    /// arrives while one is already showing.
+    Dismiss,
+}
+
+/// Owns a popup window's message-pump thread. The daemon uses this to
+/// issue Update / Dismiss commands and to detect when the thread finishes.
+pub struct PopupHandle {
+    info: Arc<Mutex<PopupInfo>>,
+    cmd_tx: mpsc::Sender<PopupCmd>,
+    join: Option<thread::JoinHandle<()>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl PopupHandle {
+    pub fn launch(initial: PopupInfo) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PopupCmd>();
+        let info = Arc::new(Mutex::new(initial.clone()));
+        let info_clone = info.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let join = thread::Builder::new()
+            .name("herdr-popup-pump".into())
+            .spawn(move || unsafe {
+                run_popup_message_pump(initial, info_clone, cmd_rx, finished_clone)
+            })
+            .expect("spawn popup thread");
+        PopupHandle {
+            info,
+            cmd_tx,
+            join: Some(join),
+            finished,
+        }
+    }
+
+    pub fn send(&self, cmd: PopupCmd) -> Result<(), mpsc::SendError<PopupCmd>> {
+        self.cmd_tx.send(cmd)
+    }
+
+    pub fn info(&self) -> &Arc<Mutex<PopupInfo>> {
+        &self.info
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.is_finished()
+    }
+
+    pub fn join_timeout(&mut self, _timeout: std::time::Duration) {
+        if let Some(j) = self.join.take() {
+            // No portable join-with-timeout on std::thread::JoinHandle.
+            // We approximate by polling is_finished. Since `finished` is
+            // set to true *just before* the thread returns, by the time
+            // we observe it, the thread is essentially done. We still
+            // call .join() to free OS resources, but don't block on it.
+            let _ = j.join();
+        }
+    }
+}
+
+/// Public entry for one-shot (non-daemon) invocations. Kept for backward
+/// compatibility with `popup-stdin` callers (deprecated; the daemon path
+/// uses `run_popup_message_pump` directly).
 pub fn run_popup(info: PopupInfo) {
     unsafe {
         // Register classes once per process.
@@ -114,7 +190,7 @@ pub fn run_popup(info: PopupInfo) {
         ));
         match decision {
             Decision::Suppress => return,
-            Decision::Permanent => create_popup(info),
+            Decision::Permanent => create_popup_oneshot(info),
         }
     }
 }
@@ -371,40 +447,74 @@ unsafe fn user_moved_into_tab(info: &PopupInfo) -> bool {
 
 /* =============================== popup window =============================== */
 
-unsafe fn create_popup(info: PopupInfo) {
-    // Pick the monitor by walking up from the EVENT-source herdr window.
-    // Otherwise a popup for an agent in dse can land on DISPLAY1 while the
-    // user is reading Chrome on DISPLAY2 -- invisible until it expires.
-    let monitor = event_source_monitor(&info.session)
-        .unwrap_or_else(|| {
-            // Fall back to cursor monitor if we cannot locate the event herdr.
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
-        });
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    let _ = GetMonitorInfoW(monitor, &mut mi);
-    let r = mi.rcWork;
-
-    // Stack above any other visible popups from this plugin on the same monitor.
-    let slot = count_visible_popups();
-    let x = r.right - POPUP_W - MARGIN;
-    let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot as i32;
-
-    let class = wide(CLASS_NAME);
+unsafe fn create_popup_oneshot(info: PopupInfo) {
+    let (x, y) = compute_popup_position(&info, count_visible_popups() as i32);
     let state = Box::new(PopupState {
         info,
         downgraded: false,
         fast_path: false,
     });
     let ptr = Box::into_raw(state);
+    let hwnd = create_popup_window(ptr as *const std::ffi::c_void, x, y);
+    if hwnd.0.is_null() {
+        drop(Box::from_raw(ptr));
+        return;
+    }
+    // Run a message loop until the window is destroyed (one-shot path).
+    let mut msg = MSG::default();
+    loop {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            if msg.message == WM_QUIT {
+                return;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if msg.hwnd == hwnd && msg.message == WM_NCDESTROY {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Pick the monitor and (x, y) for a popup anchored to the bottom-right
+/// of that monitor's work area. Daemon-mode coalesces to one popup at a
+/// time, so `slot` should always be 0 -- callers pass 0 anyway.
+unsafe fn compute_popup_position(info: &PopupInfo, slot: i32) -> (i32, i32) {
+    let monitor = event_source_monitor(&info.session).unwrap_or_else(|| {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+    });
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = GetMonitorInfoW(monitor, &mut mi);
+    let r = mi.rcWork;
+    let x = r.right - POPUP_W - MARGIN;
+    let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot;
+    log(&format!(
+        "popup monitor: work=({},{},{},{}) pos=({},{})",
+        r.left, r.top, r.right, r.bottom, x, y
+    ));
+    (x, y)
+}
+
+/// Create the popup window and return its HWND. Caller is responsible
+/// for freeing `create_params` (a `*mut PopupState`) on WM_NCDESTROY.
+/// Returns HWND(0) on failure (caller still owns `create_params`).
+unsafe fn create_popup_window(
+    create_params: *const std::ffi::c_void,
+    x: i32,
+    y: i32,
+) -> HWND {
+    let class_name = wide(CLASS_NAME);
+    let title_name = wide(CLASS_NAME);
     let hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        PCWSTR(class.as_ptr()),
-        PCWSTR(class.as_ptr()),
+        PCWSTR(class_name.as_ptr()),
+        PCWSTR(title_name.as_ptr()),
         WS_POPUP | WS_VISIBLE,
         x,
         y,
@@ -413,15 +523,23 @@ unsafe fn create_popup(info: PopupInfo) {
         None,
         None,
         module_instance(),
-        Some(ptr as *const std::ffi::c_void),
+        Some(create_params),
     );
-    let Ok(hwnd) = hwnd else {
-        drop(Box::from_raw(ptr));
-        return;
+    let hwnd = match hwnd {
+        Ok(h) => h,
+        Err(_) => {
+            log("popup: CreateWindowExW failed");
+            return HWND(std::ptr::null_mut());
+        }
     };
+    log(&format!(
+        "popup window created: hwnd={:?} visible={}",
+        hwnd.0,
+        IsWindowVisible(hwnd).as_bool()
+    ));
     let rgn = CreateRoundRectRgn(0, 0, POPUP_W, POPUP_H, ROUND, ROUND);
     let _ = SetWindowRgn(hwnd, Some(rgn), true);
-    // 强制把 popup 拉到最上层 + 抢焦点，否则浏览器/全屏应用可能盖在它之上。
+    // Force popup on top + grab focus.
     let _ = SetWindowPos(
         hwnd,
         Some(HWND_TOPMOST),
@@ -433,29 +551,94 @@ unsafe fn create_popup(info: PopupInfo) {
     );
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
-    // Default hard lifetime is AUTO_DISMISS_MS (30 minutes) so a popup shown
-    // while the user is AFK (watching video, asleep, on the phone) stays
-    // visible until they come back. The follow timer downgrades this to
-    // ACTIVE_DISMISS_MS once it detects any user input, and further to
-    // FAST_DISMISS_MS if the user is typing inside the originating pane.
+    hwnd
+}
+
+/// Run the popup message-pump on the current thread. Initial state comes
+/// from the caller's `info`; the popup's HWND_USERDATA points to a
+/// heap-allocated `PopupState` that is freed when the window is destroyed.
+///
+/// `cmd_rx` lets the daemon push `Update` / `Dismiss` commands between
+/// PeekMessageW iterations. `finished` is set to true just before the
+/// function returns so the daemon's main loop can observe thread
+/// completion promptly.
+pub unsafe fn run_popup_message_pump(
+    info: PopupInfo,
+    info_arc: Arc<Mutex<PopupInfo>>,
+    cmd_rx: mpsc::Receiver<PopupCmd>,
+    finished: Arc<AtomicBool>,
+) {
+    // Register classes once per process. Idempotent: returns 0 on the
+    // second call inside the same process, which we ignore.
+    let _ = register_class(CLASS_NAME, Some(popup_proc));
+    let _ = register_class(CONTROLLER_CLASS, Some(controller_proc));
+    let decision = decide_mode(&info);
+    log(&format!(
+        "popup session={} pane={} tab={} -> {:?}",
+        info.session, info.pane, info.tab_id, decision
+    ));
+    if matches!(decision, Decision::Suppress) {
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+
+    let state = Box::new(PopupState {
+        info: info.clone(),
+        downgraded: false,
+        fast_path: false,
+    });
+    let ptr = Box::into_raw(state);
+    let (x, y) = compute_popup_position(&info, 0);
+    let hwnd = create_popup_window(ptr as *const std::ffi::c_void, x, y);
+    if hwnd.0.is_null() {
+        drop(Box::from_raw(ptr));
+        finished.store(true, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    // Default hard lifetime is AUTO_DISMISS_MS (30 minutes).
     let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
     let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
 
-    // Run a message loop until the window is destroyed.
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             if msg.message == WM_QUIT {
-                return;
+                let _ = DestroyWindow(hwnd);
+                break;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            // After dispatching, if our window is gone, exit.
             if msg.hwnd == hwnd && msg.message == WM_NCDESTROY {
+                finished.store(true, std::sync::atomic::Ordering::SeqCst);
                 return;
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Drain any pending daemon command non-blockingly.
+        match cmd_rx.try_recv() {
+            Ok(PopupCmd::Update(new_info)) => {
+                if let Some(state) = (ptr as *mut PopupState).as_mut() {
+                    state.info = new_info.clone();
+                    state.downgraded = false;
+                    state.fast_path = false;
+                }
+                if let Ok(mut guard) = info_arc.lock() {
+                    *guard = new_info;
+                }
+                let _ = KillTimer(Some(hwnd), ID_TIMER_DISMISS);
+                let _ = KillTimer(Some(hwnd), ID_TIMER_FOLLOW);
+                let _ = SetTimer(Some(hwnd), ID_TIMER_DISMISS, AUTO_DISMISS_MS, None);
+                let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+            Ok(PopupCmd::Dismiss) => {
+                let _ = DestroyWindow(hwnd);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+        thread::sleep(Duration::from_millis(30));
     }
 }
 
@@ -483,12 +666,19 @@ unsafe fn count_visible_popups() -> u32 {
 /// on the same screen the user actually has dse open on, even if the
 /// cursor is currently on another monitor (e.g. reading Chrome on
 /// DISPLAY2 while dse is on DISPLAY1).
+///
+/// Skip minimized (IsIconic) windows: Windows parks them at (-32000,-32000)
+/// and `MonitorFromWindow` on a minimized window returns the monitor the
+/// window *was last on*, which can be wrong if the user moved dse between
+/// monitors or if the window was minimized from a different display.
 unsafe fn event_source_monitor(session: &str) -> Option<HMONITOR> {
     let session_lower = session.to_lowercase();
     let mut found: Option<HWND> = None;
+    let mut checked: u32 = 0;
     extern "system" fn enum_proc(hwnd: HWND, l: LPARAM) -> BOOL {
         unsafe {
-            let (target, sess) = &mut *(l.0 as *mut (&mut Option<HWND>, String));
+            let (target, sess, checked) = &mut *(l.0 as *mut (&mut Option<HWND>, String, u32));
+            *checked += 1;
             let mut buf = [0u16; 512];
             let n = GetWindowTextW(hwnd, &mut buf) as usize;
             if n == 0 {
@@ -503,16 +693,25 @@ unsafe fn event_source_monitor(session: &str) -> Option<HMONITOR> {
             } else {
                 title.contains(&format!("--session {}", sess))
             };
-            if matches && IsWindowVisible(hwnd).as_bool() {
+            if matches && IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
                 *(*target) = Some(hwnd);
                 return BOOL(0);
             }
             BOOL(1)
         }
     }
-    let mut pair: (&mut Option<HWND>, String) = (&mut found, session_lower);
-    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut pair as *mut _ as isize));
-    found.map(|h| MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST))
+    let mut triple: (&mut Option<HWND>, String, &mut u32) = (&mut found, session_lower, &mut checked);
+    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut triple as *mut _ as isize));
+    if let Some(h) = found {
+        log(&format!("event_source_monitor: matched hwnd={:?}", h.0));
+        Some(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST))
+    } else {
+        log(&format!(
+            "event_source_monitor: no non-minimized herdr window for session (checked={})",
+            checked
+        ));
+        None
+    }
 }
 
 /* =============================== window proc =============================== */

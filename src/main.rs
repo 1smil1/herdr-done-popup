@@ -1,25 +1,52 @@
 #![cfg(windows)]
 // herdr-done-popup
 //
-// One-shot commands, no daemons:
-//   herdr-done-popup event       <- herdr [[events]] (one process per agent event)
+// Subcommands:
+//   herdr-done-popup event       <- herdr [[events]] (short-lived; sends Request via pipe)
+//   herdr-done-popup start       <- link plugin + ensure daemon is running
+//   herdr-done-popup stop        <- unlink plugin + send Stop to daemon
+//   herdr-done-popup daemon      <- long-lived host; bound named pipe + popup
+//   herdr-done-popup query       <- one-shot: ask daemon for alive/version/pid JSON
+//   herdr-done-popup cleanup     <- kill orphan herdr-done-popup.exe when no daemon
 //   herdr-done-popup install     <- cargo build --release (one-time, local dev)
-//   herdr-done-popup start       <- link to every current Herdr session
-//   herdr-done-popup stop        <- unlink from every Herdr session
 //   herdr-done-popup uninstall   <- stop + cargo clean + dir hint
-//
-// `event` and `start` are also fired by Herdr itself: `event` from
-// [[events]], `start` from [[startup]] when the plugin is enabled in
-// any session. So you don't normally call them yourself.
 
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod daemon;
 mod gui;
-use gui::{run_popup, PopupInfo, PaneMeta};
+use daemon::{run_daemon, send_query, send_request, send_stop, spawn_daemon_detached,
+            wait_daemon_alive, daemon_alive};
+use gui::{PopupInfo, PaneMeta};
 
 const PLUGIN_ID: &str = "herdr-done-popup";
+
+/* =============================== logging =============================== */
+
+fn log_event(msg: &str) {
+    use std::time::UNIX_EPOCH;
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let path = PathBuf::from(home)
+            .join("AppData")
+            .join("Local")
+            .join("Temp")
+            .join("herdr-done-popup-event.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(f, "[{ts}] {msg}");
+        }
+    }
+}
 
 /* =============================== main / dispatch =============================== */
 
@@ -27,13 +54,16 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd] if cmd == "event" => std::process::exit(run_event()),
+        [cmd] if cmd == "daemon" => std::process::exit(run_daemon()),
+        [cmd] if cmd == "query" => run_query(),
         [cmd] if cmd == "start" => run_start(),
         [cmd] if cmd == "stop" => run_stop(),
+        [cmd] if cmd == "cleanup" => run_cleanup(),
         [cmd] if cmd == "install" => run_install(),
         [cmd] if cmd == "uninstall" => run_uninstall(),
         other => {
             eprintln!(
-                "usage: herdr-done-popup <event|start|stop|install|uninstall>  (got: {:?})",
+                "usage: herdr-done-popup <event|start|stop|daemon|query|cleanup|install|uninstall>  (got: {:?})",
                 other
             );
             std::process::exit(2);
@@ -41,7 +71,7 @@ fn main() {
     }
 }
 
-/* =============================== per-event popup =============================== */
+/* =============================== per-event sender =============================== */
 
 fn run_event() -> i32 {
     let Some(ev) = std::env::var("HERDR_PLUGIN_EVENT_JSON").ok() else {
@@ -62,12 +92,18 @@ fn run_event() -> i32 {
     let Some(status) = find_str(&root, &["status", "state", "agent_status", "agentStatus"]) else {
         return 0;
     };
-    // idle/done = 完成；blocked = agent 在提问/等批准，也必须提醒。
     if !matches!(status, "idle" | "done" | "blocked") {
         return 0;
     }
 
     let snippet = fetch_snippet(&session, pane);
+    log_event(&format!(
+        "snippet session={} pane={} len={} text={:?}",
+        session,
+        pane,
+        snippet.chars().count(),
+        snippet
+    ));
     let workspace_id = pane.split(':').next().unwrap_or("").to_string();
     let workspace_label = resolve_workspace_label(&session, &workspace_id);
     let meta = fetch_pane_meta(&session, pane, &workspace_id);
@@ -82,17 +118,42 @@ fn run_event() -> i32 {
         snippet,
         blocked: status == "blocked",
     };
-    run_popup(popup);
+    // Send via named pipe to the daemon. Best-effort: if no daemon, drop.
+    unsafe {
+        let _ = send_request(&popup);
+    }
     0
 }
 
-/* =============================== start / stop / install / uninstall =============================== */
+/* =============================== daemon control =============================== */
 
-/// `start` enables the plugin in every currently-running Herdr session.
-/// Plugin must already be linked (i.e. `install` or `herdr plugin install`
-/// has been run). One-shot. Also fired automatically by herdr via the
-/// [[startup]] action so new sessions get the plugin enabled everywhere.
+fn run_query() {
+    match unsafe { send_query() } {
+        Ok(s) => println!("{}", s),
+        Err(e) => {
+            eprintln!("query: no daemon ({})", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_start() {
+    // Ensure the daemon is running before we touch herdr's plugin state.
+    if !daemon_alive() {
+        match spawn_daemon_detached() {
+            Ok(pid) => eprintln!("start: spawned daemon pid={}", pid),
+            Err(e) => {
+                eprintln!("start: failed to spawn daemon: {}", e);
+            }
+        }
+        if wait_daemon_alive(std::time::Duration::from_secs(2)) {
+            eprintln!("start: daemon is up");
+        } else {
+            eprintln!("start: daemon failed to bind within 2s; continuing");
+        }
+    } else {
+        eprintln!("start: daemon already running");
+    }
     let sessions = list_sessions();
     if sessions.is_empty() {
         eprintln!("start: no sessions found (is herdr running?)");
@@ -108,9 +169,9 @@ fn run_start() {
     eprintln!("start: done.");
 }
 
-/// `stop` disables the plugin in every session. The plugin stays linked;
-/// run `start` again to re-enable, or `uninstall` to remove entirely.
 fn run_stop() {
+    // Tell daemon to exit gracefully.
+    let _ = unsafe { send_stop() };
     let sessions = list_sessions();
     for s in &sessions {
         match disable_session(s) {
@@ -118,14 +179,54 @@ fn run_stop() {
             Err(e) => eprintln!("stop: failed for `{}`: {}", s, e),
         }
     }
-    eprintln!("stop: done. Plugin is still linked; run `start` to re-enable, `uninstall` to remove.");
+    eprintln!("stop: done.");
 }
 
-/// `install` is the one-time permanent setup: build the binary, then
-/// link + enable in every current session. End users running from a
-/// GitHub release use `herdr plugin install <owner>/<repo>` instead —
-/// that command does the same thing plus clones the repo.
-fn run_install() {
+/// Kill any orphan herdr-done-popup.exe processes. Safe to run only when
+/// no daemon is alive (we'd never want to TerminateProcess the active
+/// daemon).
+fn run_cleanup() {
+    if daemon_alive() {
+        eprintln!("cleanup: daemon is alive; refusing to kill anything");
+        std::process::exit(1);
+    }
+    let out = match Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq herdr-done-popup.exe", "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("cleanup: tasklist failed: {}", e);
+            return;
+        }
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut killed = 0;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        if fields.len() < 2 {
+            continue;
+        }
+        if fields[0] != "herdr-done-popup.exe" {
+            continue;
+        }
+        let pid = match fields[1].parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output();
+        killed += 1;
+        eprintln!("cleanup: killed pid {}", pid);
+    }
+    eprintln!("cleanup: killed {} orphan process(es)", killed);
+}
+
+/* =============================== session management / install / uninstall =============================== */fn run_install() {
     let root = plugin_root();
     println!("install: building release binary in {}/target/release/ ...", root.display());
     match Command::new("cargo")
