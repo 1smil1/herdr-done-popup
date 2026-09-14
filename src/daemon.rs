@@ -336,14 +336,14 @@ pub fn run_daemon() -> i32 {
                                 let _ = h.send(PopupCmd::Dismiss);
                                 let _ = h.join_timeout(Duration::from_millis(100));
                                 current = None;
-                                current = Some(PopupHandle::launch(new_info));
+                                current = Some(PopupHandle::launch_all_monitors(new_info));
                             }
                         } else {
                             current = None;
-                            current = Some(PopupHandle::launch(new_info));
+                            current = Some(PopupHandle::launch_all_monitors(new_info));
                         }
                     } else {
-                        current = Some(PopupHandle::launch(new_info));
+                        current = Some(PopupHandle::launch_all_monitors(new_info));
                     }
                 }
                 Ok(DaemonMsg::Stop) => {

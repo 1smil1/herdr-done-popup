@@ -133,16 +133,62 @@ impl PopupHandle {
         let info_clone = info.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = finished.clone();
+        let cmd_rx = Arc::new(std::sync::Mutex::new(cmd_rx));
         let join = thread::Builder::new()
             .name("herdr-popup-pump".into())
             .spawn(move || unsafe {
-                run_popup_message_pump(initial, info_clone, cmd_rx, finished_clone)
+                run_popup_message_pump(initial, info_clone, cmd_rx, finished_clone, None)
             })
             .expect("spawn popup thread");
         PopupHandle {
             info,
             cmd_tx,
             join: Some(join),
+            finished,
+        }
+    }
+
+    /// Spawn one popup on every connected monitor. Returns a handle that
+    /// owns all the per-monitor threads. Send to this handle to broadcast
+    /// the same command (Update / Dismiss) to every monitor's popup.
+    pub fn launch_all_monitors(initial: PopupInfo) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PopupCmd>();
+        let info = Arc::new(Mutex::new(initial.clone()));
+        let info_clone = info.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        // Wrap the receiver in Arc<Mutex<_>> so every spawned thread can
+        // share the same channel (each thread holds its own MutexGuard).
+        let cmd_rx = Arc::new(std::sync::Mutex::new(cmd_rx));
+        let monitors = unsafe { all_monitors() };
+        let monitor_count = monitors.len();
+        log(&format!("launch_all_monitors: spawning on {} monitor(s)", monitor_count));
+        let mut joins = Vec::with_capacity(monitor_count);
+        for (i, m) in monitors.into_iter().enumerate() {
+            let info_t = info_clone.clone();
+            let finished_t = finished_clone.clone();
+            let cmd_rx_t = cmd_rx.clone();
+            let info_init = initial.clone();
+            // Pack HMONITOR into a usize for the Send boundary.
+            let m_usize = m.0 as usize;
+            let join = thread::Builder::new()
+                .name("herdr-popup-pump".into())
+                .spawn(move || unsafe {
+                    run_popup_message_pump(
+                        info_init,
+                        info_t,
+                        cmd_rx_t,
+                        finished_t,
+                        Some((HMONITOR(m_usize as *mut _), i as i32)),
+                    )
+                })
+                .expect("spawn popup thread");
+            joins.push(join);
+        }
+        PopupHandle {
+            info,
+            cmd_tx,
+            join: joins.into_iter().next(), // primary handle for join
             finished,
         }
     }
@@ -477,6 +523,23 @@ unsafe fn create_popup_oneshot(info: PopupInfo) {
     }
 }
 
+/// Compute (x, y) for a popup anchored to the bottom-right of the given
+/// monitor's work area. Used when the caller already knows which monitor
+/// to target (e.g. spawn one popup per connected monitor).
+unsafe fn position_for_monitor(monitor: HMONITOR, slot: i32) -> Option<(i32, i32)> {
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+        return None;
+    }
+    let r = mi.rcWork;
+    let x = r.right - POPUP_W - MARGIN;
+    let y = r.bottom - POPUP_H - MARGIN - (POPUP_H + GAP) * slot;
+    Some((x, y))
+}
+
 /// Pick the monitor and (x, y) for a popup anchored to the bottom-right
 /// of the monitor where the cursor currently lives. We use the cursor
 /// instead of trying to locate the event-source herdr window because the
@@ -584,8 +647,9 @@ unsafe fn create_popup_window(
 pub unsafe fn run_popup_message_pump(
     info: PopupInfo,
     info_arc: Arc<Mutex<PopupInfo>>,
-    cmd_rx: mpsc::Receiver<PopupCmd>,
+    cmd_rx: Arc<std::sync::Mutex<mpsc::Receiver<PopupCmd>>>,
     finished: Arc<AtomicBool>,
+    on_monitor: Option<(HMONITOR, i32)>,
 ) {
     // Register classes once per process. Idempotent: returns 0 on the
     // second call inside the same process, which we ignore.
@@ -607,7 +671,13 @@ pub unsafe fn run_popup_message_pump(
         fast_path: false,
     });
     let ptr = Box::into_raw(state);
-    let (x, y) = compute_popup_position(&info, 0);
+    // Pick position based on the bound monitor if given, otherwise
+    // fall back to cursor monitor.
+    let (x, y) = if let Some((m, slot)) = on_monitor {
+        position_for_monitor(m, slot).unwrap_or_else(|| compute_popup_position(&info, 0))
+    } else {
+        compute_popup_position(&info, 0)
+    };
     let hwnd = create_popup_window(ptr as *const std::ffi::c_void, x, y);
     if hwnd.0.is_null() {
         drop(Box::from_raw(ptr));
@@ -633,8 +703,9 @@ pub unsafe fn run_popup_message_pump(
             }
         }
         // Drain any pending daemon command non-blockingly.
-        match cmd_rx.try_recv() {
-            Ok(PopupCmd::Update(new_info)) => {
+        let recv_result = cmd_rx.lock().ok().map(|mut r| r.try_recv());
+        match recv_result {
+            Some(Ok(PopupCmd::Update(new_info))) => {
                 if let Some(state) = (ptr as *mut PopupState).as_mut() {
                     state.info = new_info.clone();
                     state.downgraded = false;
@@ -649,12 +720,15 @@ pub unsafe fn run_popup_message_pump(
                 let _ = SetTimer(Some(hwnd), ID_TIMER_FOLLOW, FOLLOW_POLL_MS, None);
                 let _ = InvalidateRect(Some(hwnd), None, true);
             }
-            Ok(PopupCmd::Dismiss) => {
+            Some(Ok(PopupCmd::Dismiss)) => {
                 let _ = DestroyWindow(hwnd);
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Some(Err(mpsc::TryRecvError::Empty)) => {}
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 let _ = DestroyWindow(hwnd);
+            }
+            None => {
+                // Lock poisoned; just continue.
             }
         }
         thread::sleep(Duration::from_millis(30));
