@@ -117,6 +117,7 @@ fn run_event() -> i32 {
         tab_id: meta.tab_id,
         snippet,
         blocked: status == "blocked",
+        pre_decision: None,
     };
     // Send via named pipe to the daemon. Best-effort: if no daemon, drop.
     unsafe {

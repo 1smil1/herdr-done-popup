@@ -86,10 +86,15 @@ pub struct PopupInfo {
     pub snippet: String,
     /// true = agent 处于 blocked（提问/等批准），需要用户回应
     pub blocked: bool,
+    /// Pre-computed suppression decision, set by the daemon when fanning
+    /// out a popup to multiple monitors so every monitor thread agrees.
+    /// Not serialized over the wire.
+    #[serde(skip)]
+    pub pre_decision: Option<Decision>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Decision {
+pub enum Decision {
     Suppress,
     Permanent,
 }
@@ -151,7 +156,28 @@ impl PopupHandle {
     /// Spawn one popup on every connected monitor. Returns a handle that
     /// owns all the per-monitor threads. Send to this handle to broadcast
     /// the same command (Update / Dismiss) to every monitor's popup.
-    pub fn launch_all_monitors(initial: PopupInfo) -> Self {
+    pub fn launch_all_monitors(mut initial: PopupInfo) -> Self {
+        // Compute the decision ONCE here, before fanning out, so all
+        // monitor threads agree. If we let each thread decide, any one
+        // of them seeing "user typing in this pane" would mark the
+        // shared `finished` flag and the daemon would treat the whole
+        // chain as dead.
+        let decision = unsafe { decide_mode(&initial) };
+        log(&format!(
+            "popup session={} pane={} tab={} -> {:?}",
+            initial.session, initial.pane, initial.tab_id, decision
+        ));
+        if matches!(decision, Decision::Suppress) {
+            let finished = Arc::new(AtomicBool::new(true));
+            return PopupHandle {
+                info: Arc::new(Mutex::new(initial)),
+                cmd_tx: mpsc::channel::<PopupCmd>().0,
+                join: None,
+                finished,
+            };
+        }
+        initial.pre_decision = Some(decision);
+
         let (cmd_tx, cmd_rx) = mpsc::channel::<PopupCmd>();
         let info = Arc::new(Mutex::new(initial.clone()));
         let info_clone = info.clone();
@@ -655,7 +681,13 @@ pub unsafe fn run_popup_message_pump(
     // second call inside the same process, which we ignore.
     let _ = register_class(CLASS_NAME, Some(popup_proc));
     let _ = register_class(CONTROLLER_CLASS, Some(controller_proc));
-    let decision = decide_mode(&info);
+    // If we are part of a multi-monitor launch, honour a pre-computed
+    // decision from the daemon. Otherwise decide here.
+    let decision = if let Some(d) = info.pre_decision.clone() {
+        d
+    } else {
+        decide_mode(&info)
+    };
     log(&format!(
         "popup session={} pane={} tab={} -> {:?}",
         info.session, info.pane, info.tab_id, decision
