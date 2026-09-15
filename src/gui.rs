@@ -691,10 +691,15 @@ unsafe fn create_popup_window(
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE,
     );
+    // Brief focus grab so the popup reaches the top of the Z-order above
+    // other topmost windows (Warp/Chrome fullscreen). Restored to the
+    // previously focused window after a tick.
+    let prev = GetForegroundWindow();
     let _ = BringWindowToTop(hwnd);
-    // Skip SetForegroundWindow: it steals focus from the terminal, and
-    // when the terminal later regains focus the popup gets pushed behind
-    // it. We want the popup to stay visible on top WITHOUT taking focus.
+    let _ = SetForegroundWindow(hwnd);
+    if !prev.0.is_null() {
+        let _ = SetForegroundWindow(prev);
+    }
     hwnd
 }
 
